@@ -34,13 +34,26 @@ st.markdown("""
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
     }
     .stMetric {
-        background: white;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         padding: 20px;
         border-radius: 10px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    }
+    .stMetric label {
+        color: #ffffff !important;
+        font-weight: 600;
+    }
+    .stMetric [data-testid="stMetricValue"] {
+        color: #ffffff !important;
+        font-size: 28px !important;
+        font-weight: 700;
     }
     h1, h2, h3 {
-        color: #1f2937;
+        color: #ffffff;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+    }
+    .stMarkdown {
+        color: #ffffff;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -55,8 +68,11 @@ VALID_USERS = {
 
 def check_authentication():
     """Check if user is authenticated"""
+    # Initialize session state variables
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
+    if "username" not in st.session_state:
+        st.session_state.username = None
     
     if not st.session_state.authenticated:
         st.title("🔐 Login")
@@ -77,7 +93,7 @@ def check_authentication():
 # ======================
 DB_CONFIG = {
     "username": "db42280",
-    "password": "admin2244",
+    "password": "admin2233",
     "host": "db42280.public.databaseasp.net",
     "port": "3306",
 }
@@ -102,7 +118,7 @@ def get_engine(town="prime"):
     )
 
 @st.cache_data(ttl=3600)
-def read_sql_cached(query, db_name="prime"):
+def read_sql_cached(query, db_name="db42280"):
     """Execute SQL query with caching"""
     eng = get_engine(db_name)
     return pd.read_sql(query, eng)
@@ -125,31 +141,34 @@ WITH ContinuousDeliveries AS (
         o.`Store Name` AS StoreName,
         o.`Order Booker Code` AS Booker_Code,
         o.`Order Booker Name` AS Booker_Name,
-        o.`Delivery Date` AS DeliveryDate,
-        SUM(o.`Delivered (KG)` + o.`Delivered (Litres)`) AS TotalDelivered
-    FROM ordervsdelivered o
-    INNER JOIN mapping m ON o.`SKU Code` = m.`Item Code`
-    WHERE o.`Delivery Date` >= DATE_SUB(CURDATE(), INTERVAL {months_back} MONTH)
-    GROUP BY m.brand, o.`Store Code`, o.`Store Name`, 
-             o.`Order Booker Code`, o.`Order Booker Name`, o.`Delivery Date`
-    HAVING TotalDelivered > 0
-)
-SELECT
-    brand,
-    StoreCode,
-    StoreName,
-    Booker_Code,
-    Booker_Name,
-    COUNT(*) AS Total_Deliveries,
-    SUM(CASE WHEN TotalDelivered < 12 THEN 1 ELSE 0 END) AS HalfCtnDel,
-    ROUND(
-        SUM(CASE WHEN TotalDelivered < 12 THEN 1 ELSE 0 END) / COUNT(*),
-        4
-    ) AS age
-FROM ContinuousDeliveries
-GROUP BY brand, StoreCode, StoreName, Booker_Code, Booker_Name
-HAVING Total_Deliveries >= 3 AND age > 0
-ORDER BY Booker_Name, brand, age DESC
+        o.`SKU Code` AS SKUCode,
+        o.`Delivered Units` AS Del_Units,
+        (o.`Delivered Units` / m.`UOM`) AS Deli_Ctn,
+        m.`UOM`,
+        ROW_NUMBER() OVER (PARTITION BY o.`Store Code`, m.brand ORDER BY o.`Delivery Date` ASC) AS RowNum,
+        COUNT(*) OVER (PARTITION BY o.`Store Code`, m.brand) AS TotalDeliveries,
+        CASE WHEN (o.`Delivered Units` / m.`UOM`) < 0.5 THEN 1 ELSE 0 END AS LessThanHalfCtn
+    FROM
+        (SELECT * FROM ordervsdelivered WHERE `Delivered Units` > 0) o
+    LEFT JOIN
+        sku_master m ON m.`Sku_Code` = o.`SKU Code`
+    WHERE
+        o.`Delivery Date` >= DATE_SUB(CURDATE(), INTERVAL {months_back} MONTH)
+),
+final AS (
+    SELECT
+        brand,
+        StoreCode,
+        StoreName,
+        Booker_Code,
+        Booker_Name,
+        MAX(RowNum) AS Total_Deliveries,
+        SUM(LessThanHalfCtn) AS HalfCtnDel
+    FROM
+        ContinuousDeliveries
+    GROUP BY
+        Booker_Code, Booker_Name, StoreCode, StoreName, brand
+) select *,(SUM(HalfCtnDel) / SUM(Total_Deliveries)) AS age from final
 """
     
     detail_df = pd.read_sql(booker_less_ctn_base_cte, eng)
@@ -195,14 +214,14 @@ def fetch_channel_treemap(town="prime"):
     
     query = f"""
     SELECT 
-        DATE_FORMAT(o.`Delivery Date`, '%b-%y') AS period,
+        DATE_FORMAT(o.`Delivery Date`, '%%b-%%y') AS period,
         u.`Channel Type` AS channel,
         SUM(o.`Delivered Amount` + o.`Total Discount`) AS nmv
     FROM ordervsdelivered o
     INNER JOIN universe u ON u.`Store Code` = o.`Store Code`
     WHERE o.`Delivery Date` >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
     AND o.`Delivery Date` IS NOT NULL
-    GROUP BY DATE_FORMAT(o.`Delivery Date`, '%b-%y'), u.`Channel Type`
+    GROUP BY DATE_FORMAT(o.`Delivery Date`, '%%b-%%y'), u.`Channel Type`
     ORDER BY o.`Delivery Date` DESC
     """
     
@@ -234,10 +253,26 @@ def fetch_sunburst_data(town="prime"):
 def create_treemap(df, selected_channels=None):
     """Create channel treemap with period hierarchy"""
     if df.empty:
-        return go.Figure()
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No data available for the selected period",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color="gray")
+        )
+        return fig
     
     if selected_channels:
         df = df[df['channel'].isin(selected_channels)]
+        if df.empty:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No data for selected channels",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16, color="gray")
+            )
+            return fig
     
     df['nmv_millions'] = df['nmv'] / 1_000_000
     period_totals = df.groupby('period')['nmv_millions'].sum().to_dict()
@@ -275,13 +310,20 @@ def create_treemap(df, selected_channels=None):
         ids=ids,
         text=text_labels,
         textposition="middle center",
-        marker=dict(colorscale='viridis', line=dict(width=2)),
+        textfont=dict(size=14, color='white'),
+        marker=dict(
+            colorscale='viridis',
+            line=dict(width=2, color='white')
+        ),
         hovertemplate='<b>%{label}</b><br>NMV: %{value:.2f}M<extra></extra>'
     ))
     
     fig.update_layout(
         title="🗺️ 6-Month Channel Performance (Period-wise Breakdown)",
-        height=600
+        height=600,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='white')
     )
     
     return fig
@@ -289,10 +331,26 @@ def create_treemap(df, selected_channels=None):
 def create_sunburst(df, selected_dms=None):
     """Create channel-DM sunburst chart"""
     if df.empty:
-        return px.sunburst()
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No data available",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color="gray")
+        )
+        return fig
     
     if selected_dms:
         df = df[df['dm'].isin(selected_dms)]
+        if df.empty:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No data for selected deliverymen",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16, color="gray")
+            )
+            return fig
     
     df['nmv_millions'] = df['nmv'] / 1_000_000
     
@@ -305,10 +363,16 @@ def create_sunburst(df, selected_dms=None):
     
     fig.update_traces(
         textinfo="label+percent entry",
+        textfont=dict(size=12, color='white'),
         hovertemplate='<b>%{label}</b><br>NMV: %{value:.2f}M<extra></extra>'
     )
     
-    fig.update_layout(height=600)
+    fig.update_layout(
+        height=600,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='white')
+    )
     return fig
 
 # ======================
@@ -321,10 +385,14 @@ def main():
     
     # Sidebar
     st.sidebar.title("📊 Bazaar Prime Analytics")
-    st.sidebar.markdown(f"**User:** {st.session_state.username}")
+    
+    # Display username if available
+    if st.session_state.get("username"):
+        st.sidebar.markdown(f"**User:** {st.session_state.username}")
     
     if st.sidebar.button("🚪 Logout"):
         st.session_state.authenticated = False
+        st.session_state.username = None
         st.rerun()
     
     st.sidebar.markdown("---")
@@ -349,7 +417,7 @@ def main():
     st.sidebar.subheader("📍 Location")
     town = st.sidebar.selectbox(
         "Select Location",
-        options=["prime", "primelhr"],
+        options=["db42280", "db42280"],
         format_func=lambda x: "🏙️ Karachi" if x == "prime" else "🏢 Lahore"
     )
     
@@ -396,6 +464,7 @@ def main():
     treemap_data = fetch_channel_treemap(town)
     
     if not treemap_data.empty:
+        st.success(f"✅ Loaded {len(treemap_data)} records from database")
         channels = treemap_data['channel'].unique().tolist()
         selected_channels = st.multiselect(
             "Filter Channels",
@@ -405,6 +474,8 @@ def main():
         
         treemap_fig = create_treemap(treemap_data, selected_channels)
         st.plotly_chart(treemap_fig, use_container_width=True)
+    else:
+        st.warning("⚠️ No data available for treemap. Please check database connection.")
     
     st.markdown("---")
     
@@ -413,6 +484,7 @@ def main():
     sunburst_data = fetch_sunburst_data(town)
     
     if not sunburst_data.empty:
+        st.success(f"✅ Loaded {len(sunburst_data)} records from database")
         dms = sunburst_data['dm'].unique().tolist()
         selected_dms = st.multiselect(
             "Filter Deliverymen",
@@ -422,6 +494,8 @@ def main():
         
         sunburst_fig = create_sunburst(sunburst_data, selected_dms)
         st.plotly_chart(sunburst_fig, use_container_width=True)
+    else:
+        st.warning("⚠️ No data available for sunburst chart. Please check database connection.")
     
     st.markdown("---")
     
