@@ -24,7 +24,7 @@ st.set_page_config(
     page_title="Bazaar Prime Analytics",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 
 )
 
