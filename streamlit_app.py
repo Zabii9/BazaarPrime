@@ -2322,7 +2322,7 @@ def main():
     tab1,tab2=st.tabs(["📈 Sales Growth Analysis","🎯 Booker Performance"])
     with tab1:
     # KPIs
-        st.subheader("📈 Key Performance Indicators")
+        st.subheader("📈 Key Performance Indicator")
         kpi_data = fetch_kpi_data(start_date, end_date, town_code)
 
         if not kpi_data.empty:
