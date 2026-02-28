@@ -1,19 +1,34 @@
-# 🎈 Blank app template
+# Bazaar Prime Analytics Dashboard
 
-A simple Streamlit app template for you to modify!
+Streamlit-based analytics dashboard for sales growth, booker performance, field-force deep analysis, and read-only custom SQL exploration.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
+## Documentation
 
-### How to run it on your own machine
+- End-user complete guide: [END_USER_GUIDE.md](END_USER_GUIDE.md)
 
-1. Install the requirements
+## Features (High Level)
 
+- Multi-tab analytics UI (Sales, Booker Performance, Deep Analysis, Custom Query)
+- KPI cards with period-over-period deltas
+- Target vs achievement views, heatmaps, treemaps, sankey, cohort, segmentation
+- Booker-level scoring, leaderboard, and brand low-focus summaries
+- Custom SQL tab with table/column browser and strict SELECT-only safety checks
+
+## Run Locally
+
+1. Install dependencies:
+
+   ```bash
+   pip install -r requirements.txt
    ```
-   $ pip install -r requirements.txt
+
+2. Start app:
+
+   ```bash
+   streamlit run streamlit_app.py
    ```
 
-2. Run the app
+## Configuration
 
-   ```
-   $ streamlit run streamlit_app.py
-   ```
+- Database credentials are read from Streamlit secrets and/or environment variables.
+- Make sure DB connectivity is configured before running.
