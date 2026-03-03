@@ -5400,25 +5400,41 @@ def _start_bot_process(extra_env=None):
 def _get_bot_runtime_env():
     runtime_env = {}
 
+    def _as_mapping(value):
+        return value if hasattr(value, "get") else {}
+
     secrets_db = {}
     secrets_salesflo = {}
     try:
-        if "database" in st.secrets and isinstance(st.secrets["database"], dict):
-            secrets_db = st.secrets["database"]
+        if "database" in st.secrets:
+            secrets_db = _as_mapping(st.secrets["database"])
     except Exception:
         secrets_db = {}
 
     try:
-        if "salesflo" in st.secrets and isinstance(st.secrets["salesflo"], dict):
-            secrets_salesflo = st.secrets["salesflo"]
+        if "salesflo" in st.secrets:
+            secrets_salesflo = _as_mapping(st.secrets["salesflo"])
     except Exception:
         secrets_salesflo = {}
 
-    db_user = secrets_db.get("username") or os.getenv("DB_USER") or os.getenv("DB_USERNAME") or ""
-    db_pass = secrets_db.get("password") or os.getenv("DB_PASSWORD") or os.getenv("DB_PASS") or ""
-    db_host = secrets_db.get("host") or os.getenv("DB_HOST") or ""
-    db_port = str(secrets_db.get("port") or os.getenv("DB_PORT") or "3306")
-    db_name = secrets_db.get("database") or os.getenv("DB_NAME") or ""
+    # Prefer already-resolved DB config used by Streamlit app itself.
+    db_user = str(DB_CONFIG.get("username", "") or "").strip()
+    db_pass = str(DB_CONFIG.get("password", "") or "").strip()
+    db_host = str(DB_CONFIG.get("host", "") or "").strip()
+    db_port = str(DB_CONFIG.get("port", "") or "").strip()
+    db_name = str(DB_CONFIG.get("database", "") or "").strip()
+
+    # Fallback chain if DB_CONFIG is missing any field.
+    if not db_user:
+        db_user = str(secrets_db.get("username") or st.secrets.get("DB_USER", "") or st.secrets.get("DB_USERNAME", "") or os.getenv("DB_USER") or os.getenv("DB_USERNAME") or "").strip()
+    if not db_pass:
+        db_pass = str(secrets_db.get("password") or st.secrets.get("DB_PASSWORD", "") or st.secrets.get("DB_PASS", "") or os.getenv("DB_PASSWORD") or os.getenv("DB_PASS") or "").strip()
+    if not db_host:
+        db_host = str(secrets_db.get("host") or st.secrets.get("DB_HOST", "") or os.getenv("DB_HOST") or "").strip()
+    if not db_port:
+        db_port = str(secrets_db.get("port") or st.secrets.get("DB_PORT", "") or os.getenv("DB_PORT") or "3306").strip()
+    if not db_name:
+        db_name = str(secrets_db.get("database") or st.secrets.get("DB_NAME", "") or os.getenv("DB_NAME") or "").strip()
 
     if db_user:
         runtime_env["DB_USER"] = str(db_user)
@@ -5433,12 +5449,26 @@ def _get_bot_runtime_env():
     if db_name:
         runtime_env["DB_NAME"] = str(db_name)
 
-    sf_user = secrets_salesflo.get("SALESFLO_USERNAME") or secrets_salesflo.get("username") or os.getenv("SALESFLO_USERNAME") or ""
-    sf_pass = secrets_salesflo.get("SALESFLO_PASSWORD") or secrets_salesflo.get("password") or os.getenv("SALESFLO_PASSWORD") or ""
+    sf_user = (
+        secrets_salesflo.get("SALESFLO_USERNAME")
+        or secrets_salesflo.get("username")
+        or st.secrets.get("SALESFLO_USERNAME", "")
+        or os.getenv("SALESFLO_USERNAME")
+        or ""
+    )
+    sf_pass = (
+        secrets_salesflo.get("SALESFLO_PASSWORD")
+        or secrets_salesflo.get("password")
+        or st.secrets.get("SALESFLO_PASSWORD", "")
+        or os.getenv("SALESFLO_PASSWORD")
+        or ""
+    )
     sf_user2 = (
         secrets_salesflo.get("SALESFLO_USERNAME2")
         or secrets_salesflo.get("SALESFLO_USERNAME_2")
         or secrets_salesflo.get("username2")
+        or st.secrets.get("SALESFLO_USERNAME2", "")
+        or st.secrets.get("SALESFLO_USERNAME_2", "")
         or os.getenv("SALESFLO_USERNAME2")
         or os.getenv("SALESFLO_USERNAME_2")
         or ""
@@ -5447,6 +5477,8 @@ def _get_bot_runtime_env():
         secrets_salesflo.get("SALESFLO_PASSWORD2")
         or secrets_salesflo.get("SALESFLO_PASSWORD_2")
         or secrets_salesflo.get("password2")
+        or st.secrets.get("SALESFLO_PASSWORD2", "")
+        or st.secrets.get("SALESFLO_PASSWORD_2", "")
         or os.getenv("SALESFLO_PASSWORD2")
         or os.getenv("SALESFLO_PASSWORD_2")
         or ""
