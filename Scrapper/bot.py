@@ -2733,6 +2733,11 @@ async def _launch_browser_with_bootstrap(pw):
         return await pw.chromium.launch(headless=True)
     except Exception as exc:
         err_text = str(exc)
+        if "error while loading shared libraries" in err_text or "libglib-2.0.so.0" in err_text:
+            log.error(
+                "Chromium launch failed due to missing Linux shared libraries. "
+                "On Streamlit Cloud, add required apt packages in packages.txt and redeploy."
+            )
         missing_browser = (
             "Executable doesn't exist" in err_text
             or "Please run the following command to download new browsers" in err_text
