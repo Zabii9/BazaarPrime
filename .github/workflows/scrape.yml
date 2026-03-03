@@ -38,4 +38,4 @@ jobs:
           SALESFLO_USERNAME2: ${{ secrets.SALESFLO_USERNAME2 }}
           SALESFLO_PASSWORD2: ${{ secrets.SALESFLO_PASSWORD2 }}
         run: |
-          Scrapper/bott.py
+         python Scrapper/bott.py
