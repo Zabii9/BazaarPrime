@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import hashlib
+import time
 import subprocess
 import sys
 from pathlib import Path
@@ -1304,11 +1305,75 @@ async def login(page, username: str, password: str, account_label: str = "accoun
         except Exception:
             raise last_nav_error
 
-    username_input = page.locator('input[name="username"], input#username, input[type="text"]').first
-    password_input = page.locator('input[name="password"], input#password, input[type="password"]').first
+    async def _iter_roots():
+        return [page] + list(page.frames)
 
-    await username_input.wait_for(state="attached", timeout=10000)
-    await password_input.wait_for(state="attached", timeout=10000)
+    async def _find_first(selectors: list[str], timeout_ms: int = 25000):
+        end_time = time.time() + (timeout_ms / 1000)
+        while time.time() < end_time:
+            roots = await _iter_roots()
+            for root in roots:
+                for selector in selectors:
+                    try:
+                        loc = root.locator(selector).first
+                        if await loc.count() > 0:
+                            return loc
+                    except Exception:
+                        continue
+            await asyncio.sleep(0.4)
+        return None
+
+    async def _find_login_inputs():
+        username_selectors = [
+            'input[name="username"]',
+            'input#username',
+            'input[name="email"]',
+            'input#email',
+            'input[name="mobile"]',
+            'input[name*="user" i]',
+            'input[id*="user" i]',
+            'input[type="text"]',
+        ]
+        password_selectors = [
+            'input[name="password"]',
+            'input#password',
+            'input[name*="pass" i]',
+            'input[id*="pass" i]',
+            'input[type="password"]',
+        ]
+
+        username_loc = await _find_first(username_selectors, timeout_ms=25000)
+        password_loc = await _find_first(password_selectors, timeout_ms=25000)
+        return username_loc, password_loc
+
+    username_input, password_input = await _find_login_inputs()
+
+    if username_input is None or password_input is None:
+        # One hard refresh retry for transient/slow login shells in cloud.
+        log.warning(f"[{account_label}] Login inputs not found on first pass. Retrying login page load...")
+        await page.goto(login_url, wait_until="commit", timeout=nav_timeout_ms)
+        username_input, password_input = await _find_login_inputs()
+
+    if username_input is None or password_input is None:
+        page_url = page.url
+        page_title = ""
+        try:
+            page_title = await page.title()
+        except Exception:
+            page_title = ""
+
+        # If already authenticated, continue without explicit login form.
+        try:
+            if await page.locator("text=Reports").count() > 0:
+                log.info(f"[{account_label}] Login form not shown, but Reports is visible. Assuming active session.")
+                return
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            f"Login form not found. URL={page_url} Title={page_title}. "
+            "Selectors for username/password did not appear."
+        )
 
     async def _fast_fill(target, value: str):
         try:
@@ -1347,18 +1412,22 @@ async def login(page, username: str, password: str, account_label: str = "accoun
         '.login-btn, .btn-login, [id*="login" i], [name*="login" i]',
     ]
 
+    roots = await _iter_roots()
     for selector in submit_selectors:
-        button = page.locator(selector).first
-        if await button.count() == 0:
-            continue
-        try:
-            await button.click(timeout=2000)
-            clicked = True
+        for root in roots:
+            button = root.locator(selector).first
+            if await button.count() == 0:
+                continue
+            try:
+                await button.click(timeout=2000)
+                clicked = True
+                break
+            except PlaywrightTimeout:
+                continue
+            except Exception:
+                continue
+        if clicked:
             break
-        except PlaywrightTimeout:
-            continue
-        except Exception:
-            continue
 
     if not clicked:
         try:
