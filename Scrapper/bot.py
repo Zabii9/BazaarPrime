@@ -2767,32 +2767,32 @@ def _ensure_playwright_browser_available() -> None:
     browser_cache_dir = str(Path.home() / ".cache" / "ms-playwright")
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", browser_cache_dir)
 
-    install_commands = [
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        [sys.executable, "-m", "playwright", "install"],
-    ]
+    # install_commands = [
+    #     [sys.executable, "-m", "playwright", "install", "chromium"],
+    #     [sys.executable, "-m", "playwright", "install"],
+    # ]
 
-    for install_cmd in install_commands:
-        try:
-            proc = subprocess.run(
-                install_cmd,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if proc.returncode == 0:
-                log.info("Playwright browser install check passed using: %s", " ".join(install_cmd))
-                return
+    # for install_cmd in install_commands:
+    #     try:
+    #         proc = subprocess.run(
+    #             install_cmd,
+    #             capture_output=True,
+    #             text=True,
+    #             check=False,
+    #         )
+    #         if proc.returncode == 0:
+    #             log.info("Playwright browser install check passed using: %s", " ".join(install_cmd))
+    #             return
 
-            log.warning(
-                "Playwright install attempt failed (exit=%s): %s",
-                proc.returncode,
-                " ".join(install_cmd),
-            )
-            if proc.stderr:
-                log.warning("Playwright install stderr: %s", proc.stderr[-2000:])
-        except Exception as exc:
-            log.warning("Playwright install command error (%s): %s", " ".join(install_cmd), exc)
+    #         log.warning(
+    #             "Playwright install attempt failed (exit=%s): %s",
+    #             proc.returncode,
+    #             " ".join(install_cmd),
+    #         )
+    #         if proc.stderr:
+    #             log.warning("Playwright install stderr: %s", proc.stderr[-2000:])
+    #     except Exception as exc:
+    #         log.warning("Playwright install command error (%s): %s", " ".join(install_cmd), exc)
 
 
 async def _launch_browser_with_bootstrap(pw):
