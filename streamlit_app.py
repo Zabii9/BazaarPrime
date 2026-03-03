@@ -5584,6 +5584,43 @@ def _get_refresh_data_password():
     ).strip()
 
 
+def _get_bot_runner_password():
+    password_value = ""
+
+    try:
+        scheduler_section = st.secrets.get("scheduler", {})
+        if hasattr(scheduler_section, "get"):
+            password_value = (
+                scheduler_section.get("BOT_RUNNER_PASSWORD")
+                or scheduler_section.get("bot_runner_password")
+                or ""
+            )
+    except Exception:
+        password_value = ""
+
+    if not password_value:
+        try:
+            password_value = (
+                st.secrets.get("BOT_RUNNER_PASSWORD", "")
+                or st.secrets.get("bot_runner_password", "")
+                or st.secrets.get("REFRESH_PASSWORD", "")
+                or st.secrets.get("refresh_password", "")
+                or ""
+            )
+        except Exception:
+            password_value = ""
+
+    if password_value:
+        return str(password_value).strip()
+
+    return str(
+        os.getenv("BOT_RUNNER_PASSWORD")
+        or os.getenv("BOT_TAB_PASSWORD")
+        or os.getenv("REFRESH_PASSWORD")
+        or ""
+    ).strip()
+
+
 def _stop_pid(pid):
     try:
         if pid is None:
@@ -5732,6 +5769,7 @@ def main():
     if st.sidebar.button("🚪 Logout"):
         st.session_state.authenticated = False
         st.session_state.username = None
+        st.session_state["bot_runner_unlocked"] = False
         st.rerun()
         
     
@@ -7988,6 +8026,41 @@ def main():
     with tab6:
         st.subheader("🤖 Salesflo Bot Runner")
         st.caption("Run Scrapper bot from dashboard and monitor logs.")
+
+        expected_bot_tab_password = _get_bot_runner_password()
+        if "bot_runner_unlocked" not in st.session_state:
+            st.session_state["bot_runner_unlocked"] = False
+
+        if not expected_bot_tab_password:
+            st.error("Bot Runner password is not configured. Set BOT_RUNNER_PASSWORD in secrets or environment.")
+            st.stop()
+
+        if not st.session_state.get("bot_runner_unlocked"):
+            gate_col1, gate_col2 = st.columns([2, 1])
+            with gate_col1:
+                bot_runner_password_input = st.text_input(
+                    "Enter Bot Runner Password",
+                    type="password",
+                    key="bot_runner_tab_password_input",
+                )
+            with gate_col2:
+                st.markdown("<div style='height: 1.85rem;'></div>", unsafe_allow_html=True)
+                if st.button("🔓 Unlock", key="bot_runner_unlock_btn", type="primary"):
+                    if str(bot_runner_password_input or "") == expected_bot_tab_password:
+                        st.session_state["bot_runner_unlocked"] = True
+                        st.success("Bot Runner unlocked.")
+                        st.rerun()
+                    else:
+                        st.error("Invalid Bot Runner password.")
+
+            st.info("This tab is password protected.")
+            st.stop()
+
+        lock_col1, _ = st.columns([1, 5])
+        with lock_col1:
+            if st.button("🔒 Lock", key="bot_runner_lock_btn"):
+                st.session_state["bot_runner_unlocked"] = False
+                st.rerun()
 
         if "bot_runner_pid" not in st.session_state:
             st.session_state["bot_runner_pid"] = None

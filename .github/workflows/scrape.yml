@@ -1,0 +1,41 @@
+name: Daily Sales Scraper
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # Runs daily at 3:00 UTC
+  workflow_dispatch:       # Allows manual run
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r Scrapper/requirements.txt
+          playwright install chromium
+          playwright install-deps
+
+      - name: Run Scraper
+        env:
+          host: ${{ PRIME.host }}
+          database: ${{ PRIME.database }}
+          username: ${{ PRIME.username }}
+          password: ${{ PRIME.password }}
+          port: ${{ PRIME.port }}
+          SALESFLO_USERNAME: ${{ PRIME.SALESFLO_USERNAME }}
+          SALESFLO_PASSWORD: ${{ PRIME.SALESFLO_PASSWORD }}
+          SALESFLO_USERNAME2: ${{ PRIME.SALESFLO_USERNAME2 }}
+          SALESFLO_PASSWORD2: ${{ PRIME.SALESFLO_PASSWORD2 }}
+        run: |
+          Scrapper/bot.py
