@@ -27,7 +27,7 @@ from urllib.parse import quote
 import base64
 import hmac
 import hashlib
-
+from sku_analytics_tab import render_sku_analytics_advanced_tab
 # ======================
 # 🎨 CHART THEME COLORS
 # ======================
@@ -158,7 +158,33 @@ st.set_page_config(
 VALID_USERS = {
     "admin": "admin123",
     "viewer": "viewer123",
+    "feb_viewer": "feb2026secure",
 }
+
+# 🔐 USER ACCESS CONTROL - Date Restrictions
+# ======================
+# Maps usernames to allowed date ranges
+# If a user is not in this dict, they have unrestricted access
+USER_ACCESS_CONTROL = {
+    "feb_viewer": {
+        "start_date": datetime(2026, 2, 1).date(),
+        "end_date": datetime(2026, 2, 28).date(),
+        "description": "February 2026 Only",
+        "readonly": True,
+    }
+}
+
+def get_user_date_restriction(username):
+    """Get date restriction for user, returns (start_date, end_date, is_restricted) or None if unrestricted."""
+    if username in USER_ACCESS_CONTROL:
+        restriction = USER_ACCESS_CONTROL[username]
+        return (
+            restriction["start_date"],
+            restriction["end_date"],
+            True,
+            restriction.get("description", "")
+        )
+    return None, None, False, ""
 
 def _get_link_auth_secret():
     return (
@@ -7668,10 +7694,11 @@ def build_visit_brand_coverage(start_date, end_date, town_code):
         sf["nmv"] = pd.to_numeric(sf.get("nmv", 0), errors="coerce").fillna(0)
         sf = sf.dropna(subset=["visit_date"])
 
+        print([f"sold_{_brand_col(b)}" for b in brand_universe])
         for brand in brand_universe:
             sf[f"flag_{_brand_col(brand)}"] = sf["brand_classified"] == brand
         sf["flag_other"] = ~sf["brand_classified"].isin(brand_universe)
-
+        
         sales_by_doc = (
             sf[sf["doc_no"] != ""]
             .groupby(["store_code", "doc_no"], as_index=False)
@@ -8867,66 +8894,79 @@ def main():
     st.sidebar.background_color = "#EDF2EF"
 
     # Display username if available
-    if st.session_state.get("username"):
-        st.sidebar.markdown(f"**User:** {st.session_state.username}")
+    username = st.session_state.get("username")
+    if username:
+        st.sidebar.markdown(f"**User:** {username}")
 
     if st.sidebar.button("🚪 Logout"):
         st.session_state.authenticated = False
         st.session_state.username = None
         st.session_state["bot_runner_unlocked"] = False
         st.rerun()
-        
     
+    # Check for user date restrictions
+    restrict_start, restrict_end, is_restricted, restriction_desc = get_user_date_restriction(username)
+    if is_restricted:
+        st.sidebar.info(f"📅 **Limited Access** \n {restriction_desc}")
+        
     # Period selector
     # st.sidebar.subheader("📅 Period")
-    period_option = st.sidebar.selectbox(
-        "📅 Select Period",
-        options=["Last 7 Days", "Last 30 Days", "This Month", "Last Month", "Last 3 Months", "YTD", "Custom"],
-        index=2,
-    )
+    if is_restricted:
+        # For restricted users, show fixed date range
+        st.sidebar.write(f"**📅 Fixed Period:** {restrict_start} to {restrict_end}")
+        start_date = restrict_start
+        end_date = restrict_end
+        period_option = "Restricted"
+    else:
+        # Unrestricted users can select period
+        period_option = st.sidebar.selectbox(
+            "📅 Select Period",
+            options=["Last 7 Days", "Last 30 Days", "This Month", "Last Month", "Last 3 Months", "YTD", "Custom"],
+            index=2,
+        )
 
-    today = datetime.today().date()
-    if period_option == "Last 7 Days":
-        start_date = today - timedelta(days=6)
-        end_date = today
-    elif period_option == "Last 30 Days":
-        start_date = today - timedelta(days=29)
-        end_date = today
-    elif period_option == "This Month":
-        start_date = today.replace(day=1)
-        end_date = today
-    elif period_option == "Last Month":
-        first_day_this_month = today.replace(day=1)
-        end_date = first_day_this_month - timedelta(days=1)
-        start_date = end_date.replace(day=1)
-    elif period_option == "Last 3 Months":
-        first_day_this_month = today.replace(day=1)
-        end_date = today
-        start_date = (first_day_this_month - timedelta(days=1)).replace(day=1) - timedelta(days=0)
-        start_date = (start_date.replace(day=1) - timedelta(days=1)).replace(day=1)
-    elif period_option == "YTD":
-        start_date = today.replace(month=1, day=1)
-        end_date = today
-    else:  # Custom
-        col1, col2 = st.sidebar.columns(2)
-        with col1:
-            start_date = st.date_input(
-                "Start Date",
-                value=today - timedelta(days=29),
-                max_value=today,
-                key="custom_start_date",
-            )
-        with col2:
-            end_date = st.date_input(
-                "End Date",
-                value=today,
-                max_value=today,
-                key="custom_end_date",
-            )
+        today = datetime.today().date()
+        if period_option == "Last 7 Days":
+            start_date = today - timedelta(days=6)
+            end_date = today
+        elif period_option == "Last 30 Days":
+            start_date = today - timedelta(days=29)
+            end_date = today
+        elif period_option == "This Month":
+            start_date = today.replace(day=1)
+            end_date = today
+        elif period_option == "Last Month":
+            first_day_this_month = today.replace(day=1)
+            end_date = first_day_this_month - timedelta(days=1)
+            start_date = end_date.replace(day=1)
+        elif period_option == "Last 3 Months":
+            first_day_this_month = today.replace(day=1)
+            end_date = today
+            start_date = (first_day_this_month - timedelta(days=1)).replace(day=1) - timedelta(days=0)
+            start_date = (start_date.replace(day=1) - timedelta(days=1)).replace(day=1)
+        elif period_option == "YTD":
+            start_date = today.replace(month=1, day=1)
+            end_date = today
+        else:  # Custom
+            col1, col2 = st.sidebar.columns(2)
+            with col1:
+                start_date = st.date_input(
+                    "Start Date",
+                    value=today - timedelta(days=29),
+                    max_value=today,
+                    key="custom_start_date",
+                )
+            with col2:
+                end_date = st.date_input(
+                    "End Date",
+                    value=today,
+                    max_value=today,
+                    key="custom_end_date",
+                )
 
-        if start_date > end_date:
-            st.sidebar.error("Start Date cannot be after End Date")
-            start_date, end_date = end_date, start_date
+            if start_date > end_date:
+                st.sidebar.error("Start Date cannot be after End Date")
+                start_date, end_date = end_date, start_date
 
     st.sidebar.caption(f"Range: {start_date} to {end_date}")
 
@@ -9050,8 +9090,22 @@ def main():
         missing_data_has_issue = True
 
     missing_tab_label = "🔴 🧩 Missing Data" if missing_data_has_issue else "🧩 Missing Data"
-    tab_summary,tab1,tab2,tab3,tab4,tab5,tab6,tab7=st.tabs(["🗂️ Summary","📈 Sales Growth Analysis","🎯 Booker Performance","🧭 Booker & Field Force Deep Analysis","📦 Inventory","🧪 Custom Query","🤖 Bot Runner",missing_tab_label])
     
+    # Conditionally show tabs based on user restrictions
+    if is_restricted:
+        # Restricted users: hide Advance_Anal tab
+        tab_labels = ["🗂️ Summary","📈 Sales Growth Analysis","🎯 Booker Performance","🧭 Booker & Field Force Deep Analysis","📦 Inventory","🧪 Custom Query","🤖 Bot Runner",missing_tab_label]
+        tab_summary,tab1,tab2,tab3,tab4,tab5,tab6,tab7 = st.tabs(tab_labels)
+        adv_tab = None  # Not used for restricted users
+    else:
+        # Unrestricted users: show all tabs including Advance_Anal
+        tab_labels = ["Advance_Anal","🗂️ Summary","📈 Sales Growth Analysis","🎯 Booker Performance","🧭 Booker & Field Force Deep Analysis","📦 Inventory","🧪 Custom Query","🤖 Bot Runner",missing_tab_label]
+        adv_tab,tab_summary,tab1,tab2,tab3,tab4,tab5,tab6,tab7 = st.tabs(tab_labels)
+    
+    if adv_tab is not None:
+        with adv_tab:
+            render_sku_analytics_advanced_tab(start_date, end_date, town_code)
+
     with tab_summary:
              render_summary_tab_content(start_date, end_date, town_code, town)
              render_brand_coverage_tab(start_date, end_date, town_code)
@@ -10872,6 +10926,12 @@ def main():
                         )
 
     with tab5:
+        # Check if user has date restrictions - hide query runner for restricted users
+        if is_restricted:
+            st.warning("🔒 Custom Query Runner is restricted for limited-access users.")
+            st.info(f"Your access is limited to: {restriction_desc}")
+            st.stop()
+        
         st.subheader("🧪 Custom Query Runner")
         st.caption("Run read-only SQL queries on current database. Only single SELECT statements are allowed.")
 

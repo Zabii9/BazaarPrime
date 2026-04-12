@@ -1,0 +1,26 @@
+# Streamlit Configuration
+# =======================
+
+[theme]
+primaryColor = "#5B5F97"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F8FAFC"
+textColor = "#0F172A"
+font = "sans serif"
+
+[client]
+# Hide GitHub and other sources link in menu
+showErrorDetails = true
+toolbarMode = "minimal"
+
+[logger]
+level = "info"
+
+[server]
+headless = true
+runOnSave = true
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+serverAddress = "localhost"
