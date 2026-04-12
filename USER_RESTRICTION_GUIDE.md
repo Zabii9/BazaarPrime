@@ -5,7 +5,7 @@ The BazaarPrime application now supports creating users with restricted date acc
 
 ## New User Credentials
 - **Username:** `feb_viewer`
-- **Password:** `feb2026secure`
+- **Password:** Configured in `.streamlit/secrets.toml` (see below)
 - **Access:** February 2026 data only (Read-only)
 
 ## How It Works
@@ -16,9 +16,9 @@ Two new components were added to `streamlit_app.py`:
 #### VALID_USERS Dictionary (Line ~158)
 ```python
 VALID_USERS = {
-    "admin": "admin123",
-    "viewer": "viewer123",
-    "feb_viewer": "feb2026secure",  # ← New user
+    "admin": st.secrets.get("user_admin", "admin123"),  # Fallback for development
+    "viewer": st.secrets.get("user_viewer", "viewer123"),  # Fallback for development
+    "feb_viewer": st.secrets.get("user_feb_viewer", "feb2026secure"),  # Fallback for development
 }
 ```
 
@@ -35,14 +35,29 @@ USER_ACCESS_CONTROL = {
 }
 ```
 
-### 2. Access Control Function
+### 2. Secrets Configuration
+User passwords are now stored in `.streamlit/secrets.toml`:
+
+```toml
+# User Authentication
+# -------------------
+# User passwords for the BazaarPrime dashboard
+# Format: user_<username> = "password"
+user_admin = "admin123"
+user_viewer = "viewer123"
+user_feb_viewer = "feb2026secure"
+```
+
+**Important:** Never commit the `secrets.toml` file to version control. Add it to your `.gitignore` file.
+
+### 3. Access Control Function
 A new function `get_user_date_restriction()` checks if a user has date restrictions:
 ```python
 def get_user_date_restriction(username):
     """Returns (start_date, end_date, is_restricted, description)"""
 ```
 
-### 3. Enforcement in Sidebar
+### 4. Enforcement in Sidebar
 When a restricted user logs in:
 - They see an info box: `📅 Limited Access: February 2026 Only`
 - The date period selector is disabled
@@ -53,17 +68,22 @@ When a restricted user logs in:
 
 To create more users with date restrictions:
 
-1. **Add to VALID_USERS** (Line ~158):
+1. **Add password to `.streamlit/secrets.toml`**:
+```toml
+user_jan_viewer = "secure_password_here"
+```
+
+2. **Add to VALID_USERS** (Line ~158):
 ```python
 VALID_USERS = {
-    "admin": "admin123",
-    "viewer": "viewer123",
-    "feb_viewer": "feb2026secure",
-    "jan_viewer": "jan2026secure",  # New user
+    "admin": st.secrets.get("user_admin", "admin123"),
+    "viewer": st.secrets.get("user_viewer", "viewer123"),
+    "feb_viewer": st.secrets.get("user_feb_viewer", "feb2026secure"),
+    "jan_viewer": st.secrets.get("user_jan_viewer", "secure_password_here"),  # New user
 }
 ```
 
-2. **Add to USER_ACCESS_CONTROL** (Line ~165):
+3. **Add to USER_ACCESS_CONTROL** (Line ~165):
 ```python
 USER_ACCESS_CONTROL = {
     "feb_viewer": {
@@ -133,7 +153,7 @@ To test the restriction:
 1. Start the app: `streamlit run streamlit_app.py`
 2. Login with:
    - Username: `feb_viewer`
-   - Password: `feb2026secure`
+   - Password: Configured in `.streamlit/secrets.toml` (default: `feb2026secure`)
 3. Verify:
    - Info box appears showing "Limited Access"
    - Date range shows `02-01-2026 to 02-28-2026`
@@ -142,9 +162,10 @@ To test the restriction:
 
 ## Security Notes
 
-- Passwords are currently hardcoded (suitable for demo/internal use)
-- For production, use environment variables for passwords
-- Consider adding environment-based user configuration
+- Passwords are now stored securely in `.streamlit/secrets.toml` (not committed to version control)
+- Fallback passwords are provided in code for development environments
+- For production, ensure `secrets.toml` is properly secured and not accessible to unauthorized users
+- Consider using environment variables or external secret management for production deployments
 - All users have access to the same database; filtering is UI-side only
 - For complete security, implement database-level access controls
 

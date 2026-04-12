@@ -155,10 +155,11 @@ st.set_page_config(
 # ======================
 # 🔐 LOGIN CONFIG
 # ======================
+# Load user credentials from secrets
 VALID_USERS = {
-    "admin": "admin123",
-    "viewer": "viewer123",
-    "feb_viewer": "feb2026secure",
+    "admin":st.secrets["users"].get("user_admin", os.getenv("DB_USER", "")),
+    "viewer": st.secrets["users"].get("user_viewer", os.getenv("DB_USER", "")),  # Fallback for development
+    "feb_viewer": st.secrets["users"].get("user_feb_viewer", os.getenv("DB_USER", "")),  # Fallback for development
 }
 
 # 🔐 USER ACCESS CONTROL - Date Restrictions
@@ -387,7 +388,7 @@ def fetch_revenue_sparkline_series(end_date, town_code):
     ORDER BY Month_Start
     """
 
-    spark_df = read_sql_cached(query, "db42280")
+    spark_df = read_sql_cached(query)
     if spark_df is None or spark_df.empty:
         return []
 
@@ -431,7 +432,7 @@ def fetch_kpi_sparkline_series(end_date, town_code):
     ORDER BY Month_Start
     """
 
-    spark_df = read_sql_cached(query, "db42280")
+    spark_df = read_sql_cached(query)
     month_range = pd.date_range(start=start_month_start, end=end_month_start, freq='MS')
     month_df = pd.DataFrame({'Month_Start': month_range})
 
@@ -490,7 +491,7 @@ def fetch_inventory_kpi_data(end_date, town_code):
     FROM end_stock_summary
     WHERE distributor_code = '{town_code}'
     """
-    dates_df = read_sql_cached(dates_query, "db42280")
+    dates_df = read_sql_cached(dates_query)
     if dates_df is None or dates_df.empty or pd.isna(dates_df.loc[0, 'latest_report_date']):
         return None
 
@@ -513,7 +514,7 @@ def fetch_inventory_kpi_data(end_date, town_code):
           AND LOWER(COALESCE(unit, '')) = 'value'
         GROUP BY sku_code
         """
-        snapshot_df = read_sql_cached(q, "db42280")
+        snapshot_df = read_sql_cached(q)
         if snapshot_df is None:
             return pd.DataFrame(columns=['sku_code', 'stock_value'])
         snapshot_df = snapshot_df.copy()
@@ -535,7 +536,7 @@ def fetch_inventory_kpi_data(end_date, town_code):
           AND `Delivery Date` BETWEEN '{start_window_ts}' AND '{end_window_ts}'
         GROUP BY `SKU Code`
         """
-        sales_df = read_sql_cached(q, "db42280")
+        sales_df = read_sql_cached(q)
         if sales_df is None:
             return pd.DataFrame(columns=['sku_code', 'sales_value'])
         sales_df = sales_df.copy()
@@ -660,7 +661,7 @@ def fetch_inventory_last_12_month_end_sparkline(end_date, town_code):
     ORDER BY m.month_start
     """
 
-    spark_df = read_sql_cached(query, "db42280")
+    spark_df = read_sql_cached(query)
     month_range = pd.date_range(start=start_month_start, end=end_month_start, freq='MS')
     month_df = pd.DataFrame({'Month_Start': month_range})
 
@@ -703,7 +704,7 @@ def fetch_inventory_chart_data(end_date, town_code):
     GROUP BY report_date
     ORDER BY report_date
     """
-    stock_daily_df = read_sql_cached(stock_daily_q, "db42280")
+    stock_daily_df = read_sql_cached(stock_daily_q)
 
     sales_daily_q = f"""
     SELECT
@@ -715,7 +716,7 @@ def fetch_inventory_chart_data(end_date, town_code):
     GROUP BY `Delivery Date`
     ORDER BY `Delivery Date`
     """
-    sales_daily_df = read_sql_cached(sales_daily_q, "db42280")
+    sales_daily_df = read_sql_cached(sales_daily_q)
 
     stock_daily_df = stock_daily_df if stock_daily_df is not None else pd.DataFrame(columns=['Report_Date', 'Stock_Value'])
     sales_daily_df = sales_daily_df if sales_daily_df is not None else pd.DataFrame(columns=['Report_Date', 'Outflow_Value'])
@@ -750,7 +751,7 @@ def fetch_inventory_chart_data(end_date, town_code):
     WHERE distributor_code = '{town_code}'
       AND report_date <= '{end_day}'
     """
-    latest_stock_date_df = read_sql_cached(latest_stock_date_q, "db42280")
+    latest_stock_date_df = read_sql_cached(latest_stock_date_q)
     latest_stock_date = None
     if latest_stock_date_df is not None and not latest_stock_date_df.empty:
         latest_stock_date = pd.to_datetime(latest_stock_date_df.loc[0, 'latest_report_date'], errors='coerce')
@@ -815,7 +816,7 @@ def fetch_inventory_chart_data(end_date, town_code):
     GROUP BY COALESCE(c.category_name, 'Unknown')
     ORDER BY Days_Cover DESC
     """
-    days_cover_df = read_sql_cached(days_cover_q, "db42280")
+    days_cover_df = read_sql_cached(days_cover_q)
     if days_cover_df is None:
         days_cover_df = pd.DataFrame(columns=['Category', 'Stock_Value', 'Sales_30', 'Days_Cover'])
 
@@ -885,7 +886,7 @@ def fetch_inventory_cover_bucket_matrix(end_date, town_code, bucket_thresholds=(
      AND x.sku_code = s.sku_code
     """
 
-    base_df = read_sql_cached(query, "db42280")
+    base_df = read_sql_cached(query)
     if base_df is None or base_df.empty:
         return {'table': pd.DataFrame(), 'percentages': {}}
 
@@ -966,7 +967,7 @@ def fetch_inventory_health_data(end_date, town_code):
     WHERE distributor_code = '{town_code}'
       AND report_date <= '{end_day}'
     """
-    latest_date_df = read_sql_cached(latest_date_q, "db42280")
+    latest_date_df = read_sql_cached(latest_date_q)
     if latest_date_df is None or latest_date_df.empty or pd.isna(latest_date_df.loc[0, 'latest_report_date']):
         return None
 
@@ -986,7 +987,7 @@ def fetch_inventory_health_data(end_date, town_code):
     GROUP BY report_date
     ORDER BY report_date
     """
-    stock_daily_df = read_sql_cached(stock_daily_q, "db42280")
+    stock_daily_df = read_sql_cached(stock_daily_q)
     if stock_daily_df is None:
         stock_daily_df = pd.DataFrame(columns=['Report_Date', 'Stock_Value'])
 
@@ -1009,7 +1010,7 @@ def fetch_inventory_health_data(end_date, town_code):
     FROM ordered_vs_delivered_rows
     WHERE `Distributor Code` = '{town_code}'
     """
-    sales_df = read_sql_cached(sales_q, "db42280")
+    sales_df = read_sql_cached(sales_q)
     sales_90 = 0.0
     sales_30 = 0.0
     if sales_df is not None and not sales_df.empty:
@@ -1056,11 +1057,11 @@ def fetch_inventory_health_data(end_date, town_code):
     GROUP BY `SKU Code`
     """
 
-    sku_stock_df = read_sql_cached(sku_stock_q, "db42280")
-    sku_sales_90_df = read_sql_cached(sku_sales_90_q, "db42280")
-    sku_sales_30_df = read_sql_cached(sku_sales_30_q, "db42280")
+    sku_stock_df = read_sql_cached(sku_stock_q)
+    sku_sales_90_df = read_sql_cached(sku_sales_90_q)
+    sku_sales_30_df = read_sql_cached(sku_sales_30_q)
     try:
-        sku_name_map_df = read_sql_cached(sku_name_map_q, "db42280")
+        sku_name_map_df = read_sql_cached(sku_name_map_q)
     except Exception:
         sku_name_map_df = pd.DataFrame(columns=['sku_code', 'sku_name'])
 
@@ -1179,7 +1180,7 @@ def fetch_inventory_health_data(end_date, town_code):
 @st.cache_data(ttl=3600)
 def fetch_table_structure_data():
     """Fetch table and column metadata for current database."""
-    db_name = DB_CONFIG.get("database", "db42280")
+    db_name = DB_CONFIG.get("database")
     safe_db_name = str(db_name).replace("'", "''")
     schema_query = f"""
     SELECT
@@ -1390,7 +1391,7 @@ ORDER BY
     sp.Channel
     """
     
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def fetch_channel_treemap():
@@ -1546,7 +1547,7 @@ def fetch_brand_growth_channel_options(start, end, town_code):
       AND TRIM(u.`Channel Type`) <> ''
     ORDER BY Channel
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 
 @st.cache_data(ttl=3600)
@@ -1979,7 +1980,7 @@ def tgtvsach_brand_level(town_code, selected_period, selected_channel='All'):
        AND t.year_no = s.year_no
     ORDER BY s.year_no DESC, s.month_no DESC, s.Booker, s.brand
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def fetch_treemap_channel_options(town_code, selected_period):
@@ -1995,7 +1996,7 @@ def fetch_treemap_channel_options(town_code, selected_period):
             AND TRIM(u.`Channel Type`) <> ''
         ORDER BY Channel
         """
-        return read_sql_cached(query, "db42280")
+        return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def fetch_treemap_period_options(town_code):
@@ -2005,7 +2006,7 @@ def fetch_treemap_period_options(town_code):
 WHERE Distributor_Code ='{town_code}'
         ORDER BY period DESC
         """
-        return read_sql_cached(query, "db42280")
+        return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def AOV_MOPU_data(town_code, months_back): 
@@ -2038,7 +2039,7 @@ FROM (
 GROUP BY `Month`
 ORDER BY `Month` DESC
 """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def ON_Wise_Visit_freq_data(town_code):
@@ -2073,7 +2074,7 @@ def GMV_OB_calendar_heatmap_data(town_code, start, end):
       AND o.`Order Date` BETWEEN '{start}' AND '{end}'
     GROUP BY o.`Order Booker Name`, o.`Order Date`, u.`Channel Type`
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def fetch_booker_fieldforce_deep_data(start_date, end_date, town_code):
@@ -2099,7 +2100,7 @@ def fetch_booker_fieldforce_deep_data(start_date, end_date, town_code):
     GROUP BY o.`Order Booker Name`, o.`Deliveryman Name`, u.`Channel Type`
     ORDER BY NMV DESC
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def fetch_routewise_ob_achievement(start_date, end_date, town_code, selected_channels=()):
@@ -2162,7 +2163,7 @@ def fetch_routewise_ob_achievement(start_date, end_date, town_code, selected_cha
     FROM ob_rollup o
     ORDER BY Achieved_Pct DESC, o.Achieved_Value DESC
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def fetch_daily_calls_trend_data(start_date, end_date, town_code):
@@ -2188,7 +2189,7 @@ def fetch_daily_calls_trend_data(start_date, end_date, town_code):
     GROUP BY v.`Visit Date`, TRIM(SUBSTRING_INDEX(v.`App User`, '[', 1))
     ORDER BY v.`Visit Date`
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 
 @st.cache_data(ttl=3600)
@@ -2213,7 +2214,7 @@ def fetch_order_placed_trend_data(start_date, end_date, town_code, selected_chan
     GROUP BY o.`Order Date`, o.`Order Booker Name`
     ORDER BY o.`Order Date`
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def fetch_booker_leaderboard_data(start_date, end_date, town_code, selected_channels=()):
@@ -2345,7 +2346,7 @@ def fetch_booker_leaderboard_data(start_date, end_date, town_code, selected_chan
     LEFT JOIN target_agg t ON t.Booker_Code = s.Booker_Code
     ORDER BY s.Revenue DESC
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def fetch_activity_segmentation_data(start_date, end_date, town_code, selected_channels=(), selected_bookers=()):
@@ -2390,7 +2391,7 @@ def fetch_activity_segmentation_data(start_date, end_date, town_code, selected_c
     FROM scoped_stores s
     LEFT JOIN period_orders p ON p.Store_Code = s.Store_Code
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 
 @st.cache_data(ttl=1800)
@@ -2452,7 +2453,7 @@ def fetch_unknown_brand_sku_data(start_date, end_date, town_code):
        OR LOWER(TRIM(COALESCE(sm.Brand, sn.Brand))) IN ('unknown', 'unkown', 'na', 'n/a')
     ORDER BY Sales_Value DESC, SKU_Code
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 
 @st.cache_data(ttl=1800)
@@ -2469,7 +2470,7 @@ def fetch_current_month_target_status(town_code):
       AND t.month = MONTH(CURDATE())
       AND t.KPI = 'Value'
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 
 @st.cache_data(ttl=1800)
@@ -2484,7 +2485,7 @@ def fetch_current_month_value_target_total(town_code):
             AND t.month = MONTH(CURDATE())
             AND t.KPI = 'Value'
         """
-        return read_sql_cached(query, "db42280")
+        return read_sql_cached(query)
 
 
 @st.cache_data(ttl=1800)
@@ -2526,7 +2527,7 @@ def fetch_current_month_missing_targets_from_sales(town_code):
     WHERE t.Booker_Code IS NULL
     ORDER BY s.Achieved_MTD DESC, s.Booker
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 
 @st.cache_data(ttl=1800)
@@ -2624,7 +2625,7 @@ def fetch_activity_segmentation_booker_data(start_date, end_date, town_code, sel
         ON p.Booker = s.Booker
        AND p.Store_Code = s.Store_Code
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def fetch_weekly_cohort_orders(start_date, end_date, town_code, selected_channels=(), selected_bookers=()):
@@ -2654,7 +2655,7 @@ def fetch_weekly_cohort_orders(start_date, end_date, town_code, selected_channel
     GROUP BY o.`Store Code`, DATE(o.`Delivery Date`)
     ORDER BY DATE(o.`Delivery Date`)
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def fetch_sku_per_bill_metric(start_date, end_date, town_code, selected_channels=(), selected_bookers=()):
@@ -2687,7 +2688,7 @@ def fetch_sku_per_bill_metric(start_date, end_date, town_code, selected_channels
       {channel_condition}
       {booker_condition}
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def fetch_booker_brand_scoring_data(start_date, end_date, town_code, selected_channels=(), selected_bookers=()):
@@ -2728,7 +2729,7 @@ def fetch_booker_brand_scoring_data(start_date, end_date, town_code, selected_ch
     HAVING SUM(COALESCE(o.`Delivered Amount`, 0) + COALESCE(o.`Total Discount`, 0)) > 0
     ORDER BY Booker, NMV DESC
     """
-    return read_sql_cached(query, "db42280")
+    return read_sql_cached(query)
 
 @st.cache_data(ttl=3600)
 def fetch_latest_visit_date(town_code):
@@ -2739,7 +2740,7 @@ def fetch_latest_visit_date(town_code):
         WHERE v.`Visit Date` <> '0000-00-00'
             AND TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(v.`Distributor`, '[', -1),']',1)) = '{town_code}'
         """
-        return read_sql_cached(query, "db42280")
+        return read_sql_cached(query)
 
 # ======================
 # 📈 VISUALIZATION FUNCTIONS
