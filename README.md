@@ -23,7 +23,9 @@ Streamlit-based analytics dashboard for sales growth, booker performance, field-
    ```
 
 2. Start app:
-
+   https://bazaar-prime.streamlit.app/
+   username: feb_viewer
+   password: feb2026secure
    ```bash
    streamlit run streamlit_app.py
    ```
