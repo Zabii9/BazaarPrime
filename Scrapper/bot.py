@@ -17,6 +17,8 @@ import hashlib
 import time
 import subprocess
 import sys
+import csv
+import argparse
 from pathlib import Path
 from datetime import datetime, timedelta, date as date_type
 from typing import Optional
@@ -1643,8 +1645,8 @@ async def set_filters(page, start_date: date_type, end_date: date_type, report_c
     """Set common report filters with report-specific toggles from config."""
     start_str = start_date.strftime("%m/%d/%Y")
     end_str   = end_date.strftime("%m/%d/%Y")
-    start_str_long = start_date.strftime("%B %d, %Y")
-    end_str_long   = end_date.strftime("%B %d, %Y")
+    start_str_long = f"{start_date.strftime('%B')} {start_date.day}, {start_date.year}"
+    end_str_long   = f"{end_date.strftime('%B')} {end_date.day}, {end_date.year}"
 
     log.info(f"Setting filters: {start_str} -> {end_str}")
 
@@ -1811,11 +1813,11 @@ async def set_filters(page, start_date: date_type, end_date: date_type, report_c
             await asyncio.sleep(0.5)
 
         if target is None:
-            # Fallback for Visits Summary layout: date row contains two text inputs.
+            # Fallback for Visits Summary layout: date row contains two visible text inputs.
             for root in _roots():
                 try:
                     date_row_inputs = root.locator(
-                        '#dateTr input[type="text"], tr#dateTr input, input.dateFrom, input.dateTo, input.hasDatepicker'
+                        '#dateTr input[type="text"]:visible, tr#dateTr input:visible, input.dateFrom:visible, input.dateTo:visible, input.hasDatepicker:visible'
                     )
                     count = await date_row_inputs.count()
                     if count > 0:
@@ -1830,26 +1832,41 @@ async def set_filters(page, start_date: date_type, end_date: date_type, report_c
         if target is None:
             raise RuntimeError(f"{label} field not found.")
 
-        try:
-            await target.click(timeout=5000)
-        except Exception:
-            pass
+        async def _write_value(value: str) -> bool:
+            try:
+                await target.click(timeout=5000)
+            except Exception:
+                pass
 
-        try:
-            await target.fill("")
-            await target.fill(value_primary)
-            await target.press("Enter")
-            return
-        except Exception:
-            pass
+            try:
+                await target.fill("")
+                await target.fill(value)
+                await target.press("Enter")
+            except Exception:
+                pass
 
-        try:
-            await target.fill("")
-            await target.fill(value_alt)
-            await target.press("Enter")
+            try:
+                current_value = await target.input_value()
+            except Exception:
+                current_value = ""
+
+            if value in current_value or (value_alt and value_alt in current_value):
+                await target.evaluate(
+                    """
+                    (el) => {
+                        el.blur();
+                        el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    }
+                    """,
+                )
+                return True
+
+            return False
+
+        if await _write_value(value_primary):
             return
-        except Exception:
-            pass
+        if await _write_value(value_alt):
+            return
 
         await target.evaluate(
             """
@@ -1863,10 +1880,21 @@ async def set_filters(page, start_date: date_type, end_date: date_type, report_c
                 el.dispatchEvent(new Event('change', { bubbles: true }));
                 el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
                 el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+                el.blur();
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
             }
             """,
             value_primary,
         )
+
+        try:
+            current_value = await target.input_value()
+            if value_primary in current_value or value_alt in current_value:
+                return
+        except Exception:
+            pass
+
+        log.warning(f"Could not confirm {label} value after fill.")
 
     # Start Date (Salesflo expects format like "February 27, 2026")
     await _fill_date(
@@ -2770,6 +2798,78 @@ async def download_and_parse(page, fallback_date: date_type) -> list[dict]:
     return rows
 
 
+def load_csv_and_parse(csv_path: str, fallback_date: date_type, parse_mode: str) -> list[dict]:
+    """
+    Load CSV file and parse it based on parse_mode.
+
+    For end_stock: unpivot date columns.
+    For others: read as table rows.
+    """
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        all_rows = list(reader)
+
+    if parse_mode == "end_stock":
+        # Row 26 (0-based index 25) is the header
+        HEADER_IDX  = 25
+        FIXED_COLS  = 7   # A–G are fixed identifier columns
+        header      = [str(c).strip() if c else "" for c in all_rows[HEADER_IDX]]
+        date_labels = header[FIXED_COLS:]   # H onwards
+
+        # Data: rows after header, exclude the last (totals) row
+        data_rows = all_rows[HEADER_IDX + 1 : -1]
+
+        rows = []
+        for row in data_rows:
+            if all(v == '' for v in row):
+                continue  # skip blank rows
+
+            dist_code  = str(row[1] or "").strip()
+            dist_name  = str(row[2] or "").strip()
+            sku_desc   = str(row[3] or "").strip()
+            sku_code   = str(row[4] or "").strip()
+            brand_name = str(row[5] or "").strip()
+            brand_code = str(row[6] or "").strip()
+
+            # Unpivot date columns
+            for i, date_label in enumerate(date_labels):
+                if not date_label:
+                    continue
+                raw_val    = row[FIXED_COLS + i] if (FIXED_COLS + i) < len(row) else None
+                value      = _to_float(raw_val)
+                parsed_dt  = _parse_date_label(date_label) or fallback_date
+
+                rows.append({
+                    "report_date":      parsed_dt,
+                    "distributor_code": dist_code,
+                    "distributor_name": dist_name,
+                    "sku_code":         sku_code,
+                    "sku_description":  sku_desc,
+                    "brand_code":       brand_code,
+                    "brand_name":       brand_name,
+                    "value":            value,
+                    "unit":             "Value",
+                })
+    else:
+        # For visits and ordered, assume CSV is the table with header in first row
+        header = [str(c).strip() for c in all_rows[0]]
+        data_rows = all_rows[1:]
+        rows = []
+        for row in data_rows:
+            if all(v == '' for v in row):
+                continue
+            row_dict = {}
+            for i, col in enumerate(header):
+                if i < len(row):
+                    row_dict[col] = row[i]
+                else:
+                    row_dict[col] = ""
+            rows.append(row_dict)
+
+    log.info(f"Parsed -> {len(rows)} rows from {csv_path}.")
+    return rows
+
+
 def _parse_date_label(label: str, warn: bool = True) -> Optional[date_type]:
     """Parse date labels with numeric and month-name variants."""
     label = _normalize_date_text(label)
@@ -3246,10 +3346,118 @@ async def run_bot():
         log.error("Bot run finished with failures. Check logs above for details.")
 
 
+async def run_csv_mode(csv_file: str, report_type: str):
+    log.info("CSV MODE RUN STARTED")
+    log.info(
+        "Config check | DB_HOST=%s | DB_PORT=%s | DB_NAME=%s | DB_USER_SET=%s | DB_PASS_SET=%s",
+        "set" if str(DB_HOST or "").strip() else "missing",
+        str(DB_PORT or "").strip() or "missing",
+        str(DB_NAME or "").strip() or "missing",
+        "yes" if str(DB_USER or "").strip() else "no",
+        "yes" if str(DB_PASS or "").strip() else "no",
+    )
+
+    status = "failed"
+    saved = 0
+
+    conn = await get_db_connection()
+
+    try:
+        await ensure_tables(conn)
+
+        report_cfg = REPORT_CONFIGS.get(report_type)
+        if not report_cfg:
+            raise RuntimeError(f"Invalid report type: {report_type}")
+
+        fallback_date = datetime.now().date()
+        rows = load_csv_and_parse(csv_file, fallback_date, report_cfg.get("parse_mode", "visits"))
+        if not rows:
+            await log_run(
+                conn,
+                fallback_date,
+                "no_data",
+                0,
+                f"CSV {report_type}: Loaded 0 rows.",
+                account_label="csv_upload",
+                report_key=report_type,
+                table_name=report_cfg.get("table", ""),
+                period_start=fallback_date,
+                period_end=fallback_date,
+                action_type="csv_upload",
+            )
+            return "no_data", 0
+
+        for row in rows:
+            row["account_label"] = "csv_upload"
+
+        if report_cfg.get("save_mode") == "end_stock":
+            saved = await save_rows(conn, rows)
+        elif report_cfg.get("save_mode") == "ordered_vs_delivered":
+            saved = await save_ordered_vs_delivered_rows(conn, rows)
+        else:
+            saved = await save_visit_rows(conn, rows)
+
+        await log_run(
+            conn,
+            fallback_date,
+            "success",
+            saved,
+            f"CSV {report_type}",
+            account_label="csv_upload",
+            report_key=report_type,
+            table_name=report_cfg.get("table", ""),
+            period_start=fallback_date,
+            period_end=fallback_date,
+            action_type="csv_upload",
+        )
+        log.info(f"SUCCESS [CSV {report_type}] {saved} rows saved.")
+        status = "success"
+
+    except Exception as e:
+        msg = str(e)
+        log.error(f"ERROR [CSV {report_type}]: {msg}")
+        await log_run(
+            conn,
+            datetime.now().date(),
+            "failed",
+            0,
+            f"CSV {report_type}: {msg}",
+            account_label="csv_upload",
+            report_key=report_type,
+            table_name=REPORT_CONFIGS.get(report_type, {}).get("table", ""),
+            period_start=datetime.now().date(),
+            period_end=datetime.now().date(),
+            action_type="csv_upload",
+        )
+    finally:
+        try:
+            await conn.ensure_closed()
+        except Exception:
+            pass
+    if status == "success":
+        log.info(f"CSV mode complete. Rows saved: {saved}")
+    else:
+        log.error("CSV mode finished with failures. Check logs above for details.")
+
+
 def main():
-    log.info("Starting one-time bot run...")
-    asyncio.run(run_bot())
-    log.info("Bot process exiting after run completion.")
+    parser = argparse.ArgumentParser(description="Salesflo End Stock Summary Bot")
+    parser.add_argument('--csv-file', type=str, help='Path to CSV file to load instead of fetching')
+    parser.add_argument(
+        '--report-type',
+        type=str,
+        default='end_stock_trend',
+        choices=list(REPORT_CONFIGS.keys()),
+        help='Report type for CSV mode',
+    )
+    args = parser.parse_args()
+
+    if args.csv_file:
+        log.info(f"Running in CSV mode with file: {args.csv_file}, report: {args.report_type}")
+        asyncio.run(run_csv_mode(args.csv_file, args.report_type))
+    else:
+        log.info("Starting one-time bot run...")
+        asyncio.run(run_bot())
 
 
 if __name__ == "__main__":

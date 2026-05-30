@@ -11,6 +11,7 @@ from sqlalchemy import create_engine
 from functools import lru_cache
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import plotly.io as pio
 from datetime import datetime, timedelta
 import numpy as np
@@ -27,7 +28,6 @@ from urllib.parse import quote
 import base64
 import hmac
 import hashlib
-from sku_analytics_tab import render_sku_analytics_advanced_tab
 # ======================
 # 🎨 CHART THEME COLORS
 # ======================
@@ -351,16 +351,27 @@ def read_sql_cached(query, db_name="db42280"):
     return pd.read_sql(query, eng)
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=60)
 def fetch_account_last_update_data():
-    """Fetch latest Order Date by distributor account from ordered_vs_delivered_rows."""
+    """Fetch the latest account refresh date from ordered_vs_delivered_rows."""
     query = """
     SELECT
         `Distributor Code` AS Distributor_Code,
-        MAX(`Order Date`) AS Last_Update_At
+        NULLIF(
+            GREATEST(
+                COALESCE(MAX(`Order Date`), '1900-01-01'),
+                COALESCE(MAX(`Delivery Date`), '1900-01-01'),
+                COALESCE(MAX(`Report Date`), '1900-01-01')
+            ),
+            '1900-01-01'
+        ) AS Last_Update_At
     FROM ordered_vs_delivered_rows
     WHERE `Distributor Code` IN ('D70002202', 'D70002246')
-      AND `Order Date` IS NOT NULL
+      AND (
+          `Order Date` IS NOT NULL
+          OR `Delivery Date` IS NOT NULL
+          OR `Report Date` IS NOT NULL
+      )
     GROUP BY `Distributor Code`
     """
     return pd.read_sql(query, get_engine())
@@ -2190,6 +2201,103 @@ def fetch_daily_calls_trend_data(start_date, end_date, town_code):
     ORDER BY v.`Visit Date`
     """
     return read_sql_cached(query)
+
+
+@st.cache_data(ttl=3600)
+def fetch_detailed_funnel_data(start_date, end_date, town_code):
+    """Fetch detailed funnel data from visits_summary_rows including close reasons, time spent, etc."""
+    query = f"""
+    SELECT
+        TRIM(SUBSTRING_INDEX(v.`App User`, '[', 1)) AS Booker,
+        v.`Visit Date` AS Visit_Date,
+        v.`Store Name` AS Store_Name,
+        v.`Store Code` AS Store_Code,
+        v.`Visit Complete` AS Visit_Complete,
+        v.`Order Number` AS Order_Number,
+        v.`Total Value` AS Order_Value,
+        v.`Total Units` AS Order_Units,
+        v.`Total SKU Sold` AS Order_SKUs,
+        v.`Close Reason` AS Close_Reason,
+        v.`Total Spent Time` AS Total_Spent_Time,
+        v.`First Spent Time` AS First_Spent_Time,
+        v.`Non Productive w.r.t Order` AS Non_Productive_Order,
+        CASE WHEN v.`Visit Complete` = 'Yes' THEN 1 ELSE 0 END AS Executed_Visit,
+        CASE WHEN v.`Visit Complete` = 'Yes' AND COALESCE(v.`Non Productive w.r.t Order`, 'No') <> 'Yes' THEN 1 ELSE 0 END AS Productive_Visit,
+        CASE WHEN v.`Order Number` IS NOT NULL AND v.`Order Number` <> '' THEN 1 ELSE 0 END AS Has_Order
+    FROM visits_summary_rows v
+    WHERE v.`Visit Date` BETWEEN '{start_date}' AND '{end_date}'
+      AND v.`Visit Date` <> '0000-00-00'
+      AND TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(v.`Distributor`, '[', -1),']',1)) = '{town_code}'
+    ORDER BY v.`Visit Date`, TRIM(SUBSTRING_INDEX(v.`App User`, '[', 1))
+    """
+    return read_sql_cached(query)
+
+
+def parse_time_to_minutes(time_str):
+    """Parse time string to minutes.
+    Handles values like:
+      - 30
+      - 30 min
+      - 1.5 hours
+      - 1:30
+      - 1:30:00
+      - 1 hr 20 min
+      - 1h20m
+    """
+    if not time_str or str(time_str).strip() == '':
+        return None
+
+    raw = str(time_str).strip().lower()
+    raw = raw.replace('\u2019', "'").replace('\u2013', '-').replace('\u2212', '-')
+
+    # Remove common separators and normalize spaces
+    text = raw.replace(',', '').replace(' ', '')
+
+    # Pure numeric values are minutes
+    if re.fullmatch(r'\d+(?:\.\d+)?', text):
+        return float(text)
+
+    # HH:MM or HH:MM:SS formats
+    if ':' in text:
+        parts = text.split(':')
+        try:
+            if len(parts) == 2:
+                hours = float(parts[0])
+                minutes = float(parts[1])
+                return hours * 60 + minutes
+            if len(parts) == 3:
+                hours = float(parts[0])
+                minutes = float(parts[1])
+                seconds = float(parts[2])
+                return hours * 60 + minutes + seconds / 60
+        except ValueError:
+            pass
+
+    # Recognize hours and minutes in text
+    hours = 0.0
+    minutes = 0.0
+    seconds = 0.0
+
+    hour_match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*(?:h|hr|hrs|hour|hours)', raw)
+    minute_match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*(?:m|min|mins|minute|minutes)', raw)
+    second_match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*(?:s|sec|secs|second|seconds)', raw)
+
+    if hour_match:
+        hours = float(hour_match.group(1))
+    if minute_match:
+        minutes = float(minute_match.group(1))
+    if second_match:
+        seconds = float(second_match.group(1))
+
+    if hour_match or minute_match or second_match:
+        return hours * 60 + minutes + seconds / 60
+
+    # Fallback: parse any leading number as minutes
+    fallback = re.search(r'([0-9]+(?:\.[0-9]+)?)', raw)
+    if fallback:
+        return float(fallback.group(1))
+
+    return None
 
 
 @st.cache_data(ttl=3600)
@@ -6036,7 +6144,7 @@ def _is_pid_running(pid):
         return False
 
 
-def _start_bot_process(extra_env=None):
+def _start_bot_process(extra_env=None, extra_args=None):
     bot_script = _get_bot_script_path()
     if not os.path.exists(bot_script):
         raise FileNotFoundError(f"Bot script not found: {bot_script}")
@@ -6053,8 +6161,11 @@ def _start_bot_process(extra_env=None):
             for key, value in extra_env.items():
                 if value is not None:
                     process_env[str(key)] = str(value)
+        args = [sys.executable, bot_script]
+        if isinstance(extra_args, list):
+            args.extend(extra_args)
         popen_kwargs = {
-            "args": [sys.executable, bot_script],
+            "args": args,
             "cwd": os.path.dirname(__file__),
             "stdout": log_file,
             "stderr": subprocess.STDOUT,
@@ -6796,24 +6907,35 @@ def create_visit_order_delivery_funnel_chart(funnel_df, title_suffix=""):
 
     df = funnel_df.sort_values("Planned_Calls", ascending=False).head(15)
 
+    # Prepare custom data for hover templates
+    custom_data = []
+    for _, row in df.iterrows():
+        avg_time = row.get("Avg_Time_Spent", 0)
+        total_value = row.get("Total_Order_Value", 0)
+        avg_value = row.get("Avg_Order_Value", 0)
+        custom_data.append([avg_time, total_value, avg_value])
+
     fig = go.Figure()
     fig.add_trace(go.Bar(
         name="Planned Visits",
         y=df["Booker"], x=df["Planned_Calls"],
         orientation="h", marker_color="#B8B8D1",
-        hovertemplate="<b>%{y}</b><br>Planned: %{x:,.0f}<extra></extra>"
+        customdata=custom_data,
+        hovertemplate="<b>%{y}</b><br>Planned: %{x:,.0f}<br>Avg Time/Visit: %{customdata[0]:.1f} min<br>Total Order Value: Rs %{customdata[1]:,.0f}<extra></extra>"
     ))
     fig.add_trace(go.Bar(
         name="Executed Visits",
         y=df["Booker"], x=df["Executed_Calls"],
         orientation="h", marker_color="#5B5F97",
-        hovertemplate="<b>%{y}</b><br>Executed: %{x:,.0f}<extra></extra>"
+        customdata=custom_data,
+        hovertemplate="<b>%{y}</b><br>Executed: %{x:,.0f}<br>Avg Time/Visit: %{customdata[0]:.1f} min<br>Total Order Value: Rs %{customdata[1]:,.0f}<extra></extra>"
     ))
     fig.add_trace(go.Bar(
         name="Orders Placed",
         y=df["Booker"], x=df["Orders"],
         orientation="h", marker_color="#FFC145",
-        hovertemplate="<b>%{y}</b><br>Orders: %{x:,.0f}<extra></extra>"
+        customdata=custom_data,
+        hovertemplate="<b>%{y}</b><br>Orders: %{x:,.0f}<br>Avg Order Value: Rs %{customdata[2]:,.0f}<br>Total Order Value: Rs %{customdata[1]:,.0f}<extra></extra>"
     ))
     fig.update_layout(
         title=f"Visit → Order Funnel per Booker{title_suffix}",
@@ -6827,6 +6949,492 @@ def create_visit_order_delivery_funnel_chart(funnel_df, title_suffix=""):
         margin=dict(l=8, r=8, t=50, b=8),
     )
     return fig
+
+
+@st.cache_data(ttl=1800)
+def fetch_churn_intelligence_data(start_date, end_date, town_code):
+    """Fetch churn-related customer activity and cohort data for the selected town."""
+    if not start_date or not end_date:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    end_ts = pd.to_datetime(end_date, errors='coerce')
+    if pd.isna(end_ts):
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    lookback_start = (end_ts - pd.DateOffset(years=1)).date()
+    end_day = end_ts.date()
+
+    summary_query = f"""
+SELECT
+    `Store Code` AS store_code,
+    `Store Name` AS store_name,
+    MIN(`Delivery Date`) AS first_order_date,
+    MAX(`Delivery Date`) AS last_order_date,
+    COUNT(DISTINCT `Invoice Number`) AS order_count,
+    SUM(COALESCE(`Delivered Amount`, 0) + COALESCE(`Total Discount`, 0)) AS revenue
+FROM ordered_vs_delivered_rows
+WHERE `Distributor Code` = '{town_code}'
+  AND `Store Code` IS NOT NULL
+  AND `Delivery Date` BETWEEN '{lookback_start}' AND '{end_day}'
+GROUP BY `Store Code`, `Store Name`
+"""
+
+    monthly_query = f"""
+SELECT
+    DATE_FORMAT(`Delivery Date`, '%%Y-%%m') AS period,
+    COUNT(DISTINCT `Store Code`) AS active_customers,
+    SUM(COALESCE(`Delivered Amount`, 0) + COALESCE(`Total Discount`, 0)) AS revenue
+FROM ordered_vs_delivered_rows
+WHERE `Distributor Code` = '{town_code}'
+  AND `Store Code` IS NOT NULL
+  AND `Delivery Date` BETWEEN '{lookback_start}' AND '{end_day}'
+GROUP BY DATE_FORMAT(`Delivery Date`, '%%Y-%%m')
+ORDER BY DATE_FORMAT(`Delivery Date`, '%%Y-%%m')
+"""
+
+    cohort_query = f"""
+SELECT
+    DATE_FORMAT(c.first_order_date, '%%Y-%%m') AS cohort_month,
+    DATE_FORMAT(o.`Delivery Date`, '%%Y-%%m') AS activity_month,
+    COUNT(DISTINCT o.`Store Code`) AS customer_count
+FROM ordered_vs_delivered_rows o
+INNER JOIN (
+    SELECT
+        `Store Code`,
+        MIN(`Delivery Date`) AS first_order_date
+    FROM ordered_vs_delivered_rows
+    WHERE `Distributor Code` = '{town_code}'
+      AND `Store Code` IS NOT NULL
+      AND `Delivery Date` BETWEEN '{lookback_start}' AND '{end_day}'
+    GROUP BY `Store Code`
+) c ON c.`Store Code` = o.`Store Code`
+WHERE o.`Distributor Code` = '{town_code}'
+  AND o.`Store Code` IS NOT NULL
+  AND o.`Delivery Date` BETWEEN '{lookback_start}' AND '{end_day}'
+GROUP BY DATE_FORMAT(c.first_order_date, '%%Y-%%m'), DATE_FORMAT(o.`Delivery Date`, '%%Y-%%m')
+ORDER BY DATE_FORMAT(c.first_order_date, '%%Y-%%m'), DATE_FORMAT(o.`Delivery Date`, '%%Y-%%m')
+"""
+
+    summary_df = read_sql_cached(summary_query, f"churn_summary_{town_code}")
+    monthly_df = read_sql_cached(monthly_query, f"churn_trend_{town_code}")
+    cohort_df = read_sql_cached(cohort_query, f"churn_cohort_{town_code}")
+    return summary_df, monthly_df, cohort_df
+
+
+def _prepare_churn_scores(df, reference_date):
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df['first_order_date'] = pd.to_datetime(df.get('first_order_date', None), errors='coerce')
+    df['last_order_date'] = pd.to_datetime(df.get('last_order_date', None), errors='coerce')
+    df['order_count'] = pd.to_numeric(df.get('order_count', 0), errors='coerce').fillna(0).astype(int)
+    df['revenue'] = pd.to_numeric(df.get('revenue', 0), errors='coerce').fillna(0.0)
+
+    reference_dt = pd.to_datetime(reference_date, errors='coerce')
+    if pd.isna(reference_dt):
+        reference_dt = pd.Timestamp.today()
+
+    df['days_since_last'] = (reference_dt - df['last_order_date']).dt.days.fillna(999).astype(int)
+
+    df['recency_score'] = pd.cut(
+        df['days_since_last'],
+        bins=[-1, 15, 30, 60, 90, 9999],
+        labels=[5, 4, 3, 2, 1],
+    ).astype(float).fillna(1)
+
+    df['frequency_score'] = pd.cut(
+        df['order_count'],
+        bins=[-1, 1, 2, 4, 8, 9999],
+        labels=[1, 2, 3, 4, 5],
+    ).astype(float).fillna(1)
+
+    try:
+        if len(df) >= 5:
+            df['monetary_score'] = pd.qcut(
+                df['revenue'].rank(method='first'),
+                q=5,
+                labels=[1, 2, 3, 4, 5],
+            ).astype(float).fillna(1)
+        else:
+            raise ValueError('not enough values')
+    except Exception:
+        df['monetary_score'] = pd.cut(
+            df['revenue'],
+            bins=[-1, 0, 5000, 25000, 100000, 1e18],
+            labels=[1, 2, 3, 4, 5],
+        ).astype(float).fillna(1)
+
+    df['rfm_score'] = (
+        df['recency_score'] * 0.50
+        + df['frequency_score'] * 0.30
+        + df['monetary_score'] * 0.20
+    ) * 20
+    df['risk_score'] = (100.0 - df['rfm_score']).clip(lower=0, upper=100)
+
+    df['lifecycle_segment'] = 'At Risk'
+    df.loc[df['days_since_last'] <= 30, 'lifecycle_segment'] = 'Active'
+    df.loc[df['days_since_last'] > 90, 'lifecycle_segment'] = 'Churned'
+    df.loc[df['first_order_date'] >= (reference_dt - pd.Timedelta(days=90)), 'lifecycle_segment'] = 'New'
+
+    df['retention_bucket'] = pd.cut(
+        df['days_since_last'],
+        bins=[-1, 30, 60, 90, 9999],
+        labels=['Active <30d', 'At Risk 31-60d', 'Warning 61-90d', 'Churn Risk >90d'],
+        right=True,
+    ).astype(str)
+
+    return df
+
+
+def create_churn_trend_chart(df):
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No churn trend data", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    df = df.copy()
+    df['period_dt'] = pd.to_datetime(df['period'] + '-01', errors='coerce')
+    df = df.sort_values('period_dt')
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(
+        x=df['period_dt'],
+        y=df['active_customers'],
+        name='Active Customers',
+        mode='lines+markers',
+        marker=dict(size=8, color=CHART_COLORS['primary']),
+        line=dict(width=3),
+        hovertemplate='<b>%{x|%b %Y}</b><br>Active: %{y}<extra></extra>',
+    ), secondary_y=False)
+
+    fig.add_trace(go.Bar(
+        x=df['period_dt'],
+        y=df['revenue'] / 1_000_000,
+        name='Revenue (M)',
+        marker_color=CHART_COLORS['accent'],
+        opacity=0.65,
+        hovertemplate='<b>%{x|%b %Y}</b><br>Revenue: Rs %{y:.2f}M<extra></extra>',
+    ), secondary_y=True)
+
+    fig.update_layout(
+        title='📈 Monthly Churn Trend',
+        xaxis=dict(title='Period'),
+        yaxis=dict(title='Active Customers'),
+        yaxis2=dict(title='Revenue (M)', showgrid=False),
+        legend=dict(orientation='h', y=1.08, x=0.5, xanchor='center'),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=8, r=8, t=42, b=8),
+        height=340,
+    )
+    return fig
+
+
+def create_churn_cohort_heatmap(df):
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No cohort data", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    cohort_df = df.copy()
+    cohort_df['cohort_dt'] = pd.to_datetime(cohort_df['cohort_month'], format='%Y-%m', errors='coerce')
+    cohort_df['activity_dt'] = pd.to_datetime(cohort_df['activity_month'], format='%Y-%m', errors='coerce')
+    cohort_df = cohort_df.dropna(subset=['cohort_dt', 'activity_dt'])
+    cohort_df['month_offset'] = (
+        cohort_df['activity_dt'].dt.year - cohort_df['cohort_dt'].dt.year
+    ) * 12 + (cohort_df['activity_dt'].dt.month - cohort_df['cohort_dt'].dt.month)
+
+    cohort_sizes = cohort_df[cohort_df['month_offset'] == 0].set_index('cohort_month')['customer_count']
+    cohort_pivot = cohort_df.pivot_table(
+        index='cohort_month',
+        columns='month_offset',
+        values='customer_count',
+        aggfunc='sum',
+        fill_value=0,
+    )
+    retention = cohort_pivot.div(cohort_sizes, axis=0).fillna(0)
+    retention = retention.sort_index(ascending=False)
+
+    x_labels = [f'M+{int(x)}' for x in retention.columns]
+    y_labels = retention.index.tolist()
+
+    fig = go.Figure(data=go.Heatmap(
+        z=retention.values,
+        x=x_labels,
+        y=y_labels,
+        colorscale='Blues',
+        zmin=0,
+        zmax=1,
+        hovertemplate='Cohort %{y}<br>%{x}: %{z:.0%}<extra></extra>',
+    ))
+    fig.update_layout(
+        title='🔥 Cohort Retention Heatmap',
+        xaxis=dict(title='Months Since Cohort'),
+        yaxis=dict(title='Cohort Month'),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=8, r=8, t=42, b=8),
+        height=340,
+    )
+    return fig
+
+
+def create_lifecycle_pie(df):
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No lifecycle data", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    counts = df['lifecycle_segment'].value_counts().reindex(
+        ['New', 'Active', 'At Risk', 'Churned'], fill_value=0)
+    colors = ['#22C55E', '#2563EB', '#F59E0B', '#DC2626']
+
+    fig = go.Figure(go.Pie(
+        labels=counts.index,
+        values=counts.values,
+        hole=0.55,
+        marker_colors=colors,
+        hovertemplate='<b>%{label}</b>: %{value} stores<extra></extra>',
+        textinfo='label+percent',
+    ))
+    fig.update_layout(
+        title='🤖 Lifecycle Engine',
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=8, r=8, t=42, b=8),
+        height=340,
+    )
+    return fig
+
+
+def create_retention_bucket_chart(df):
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No retention bucket data", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    bucket_counts = (
+        df.groupby('retention_bucket', as_index=False)
+        .agg(Stores=('store_code', 'nunique'), Revenue=('revenue', 'sum'))
+        .sort_values('Stores', ascending=False)
+    )
+
+    fig = go.Figure(go.Bar(
+        x=bucket_counts['Stores'],
+        y=bucket_counts['retention_bucket'],
+        orientation='h',
+        marker_color=['#16A34A', '#F59E0B', '#D97706', '#DC2626'],
+        hovertemplate='<b>%{y}</b><br>Stores: %{x}<br>Revenue: Rs %{customdata[0]:,.0f}<extra></extra>',
+        customdata=bucket_counts[['Revenue']],
+    ))
+    fig.update_layout(
+        title='🪣 Retention Buckets',
+        xaxis=dict(title='Stores'),
+        yaxis=dict(title=None, autorange='reversed'),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=8, r=8, t=42, b=8),
+        height=340,
+    )
+    return fig
+
+
+def create_churn_rate_gauge(current_rate, prev_rate):
+    current_rate = float(current_rate or 0.0)
+    prev_rate = float(prev_rate or 0.0)
+    max_range = max(10.0, current_rate * 1.5, prev_rate * 1.5, 20.0)
+    fig = go.Figure(go.Indicator(
+        mode='gauge+number+delta',
+        value=current_rate,
+        delta={
+            'reference': prev_rate,
+            'position': 'bottom',
+            'valueformat': '.1f',
+            'increasing': {'color': '#DC2626'},
+            'decreasing': {'color': '#16A34A'},
+        },
+        number={'suffix': '%', 'font': {'size': 24, 'color': '#0F172A'}},
+        gauge={
+            'axis': {'range': [0, max_range]},
+            'bar': {'color': CHART_COLORS['danger']},
+            'bgcolor': '#FFFFFF',
+            'steps': [
+                {'range': [0, 5], 'color': '#DCFCE7'},
+                {'range': [5, 10], 'color': '#FEF3C7'},
+                {'range': [10, max_range], 'color': '#FEE2E2'},
+            ],
+        },
+    ))
+    fig.update_layout(
+        title='⚠️ Churn Rate',
+        margin=dict(t=30, b=0, l=0, r=0),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        height=320,
+    )
+    return fig
+
+
+def create_ml_risk_scatter(df):
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No ML scoring data", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    plot_df = df.copy()
+    plot_df['Revenue_M'] = plot_df['revenue'] / 1_000_000
+    plot_df['Days_Since_Last'] = pd.to_numeric(plot_df.get('days_since_last', 0), errors='coerce').fillna(0)
+
+    segment_order = ['New', 'Active', 'At Risk', 'Churned']
+    segment_colors = {
+        'New': '#2563EB',
+        'Active': '#22C55E',
+        'At Risk': '#F59E0B',
+        'Churned': '#DC2626',
+    }
+
+    fig = go.Figure()
+    for segment in segment_order:
+        segment_df = plot_df[plot_df['lifecycle_segment'] == segment]
+        if segment_df.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=segment_df['Revenue_M'],
+            y=segment_df['risk_score'],
+            mode='markers',
+            name=segment,
+            marker=dict(
+                size=11,
+                color=segment_colors.get(segment, '#94A3B8'),
+                line=dict(width=1, color='#FFFFFF'),
+            ),
+            customdata=np.stack([
+                segment_df['store_code'].astype(str),
+                segment_df['store_name'].astype(str),
+                segment_df['Days_Since_Last'].astype(int),
+            ], axis=-1),
+            hovertemplate=(
+                '<b>%{customdata[1]}</b><br>'
+                'Revenue: Rs %{x:.2f}M<br>'
+                'Risk Score: %{y:.0f}%<br>'
+                'Days Since Last Order: %{customdata[2]}<extra></extra>'
+            ),
+        ))
+
+    fig.update_layout(
+        title='🧠 ML Churn Scoring',
+        xaxis=dict(title='Revenue (M)'),
+        yaxis=dict(title='Risk Score (%)'),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=8, r=8, t=42, b=8),
+        height=360,
+        legend=dict(orientation='h', y=1.08, x=0.5, xanchor='center'),
+    )
+    return fig
+
+
+def create_revenue_at_risk_chart(df):
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No revenue risk data", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    summary = (
+        df.groupby('lifecycle_segment', as_index=False)
+        .agg(Revenue=('revenue', 'sum'), Avg_Risk=('risk_score', 'mean'))
+    )
+    order = ['New', 'Active', 'At Risk', 'Churned']
+    summary['lifecycle_segment'] = pd.Categorical(summary['lifecycle_segment'], categories=order, ordered=True)
+    summary = summary.sort_values('lifecycle_segment')
+    summary['Revenue_M'] = summary['Revenue'] / 1_000_000
+
+    if summary.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No revenue risk data", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    colors = {
+        'New': '#2563EB',
+        'Active': '#22C55E',
+        'At Risk': '#F59E0B',
+        'Churned': '#DC2626',
+    }
+
+    fig = go.Figure(go.Bar(
+        x=summary['Revenue_M'],
+        y=summary['lifecycle_segment'],
+        orientation='h',
+        marker_color=[colors.get(x, '#94A3B8') for x in summary['lifecycle_segment']],
+        customdata=np.stack([summary['Avg_Risk']], axis=-1),
+        hovertemplate='<b>%{y}</b><br>Revenue: Rs %{x:.2f}M<br>Avg Risk: %{customdata[0]:.1f}%<extra></extra>',
+    ))
+    fig.update_layout(
+        title='💰 Revenue at Risk by Lifecycle Segment',
+        xaxis=dict(title='Revenue (M)'),
+        yaxis=dict(title=None, autorange='reversed'),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=8, r=8, t=42, b=8),
+        height=340,
+    )
+    return fig
+
+
+def create_lifecycle_distribution_table(df):
+    if df is None or df.empty:
+        return '<div>No lifecycle distribution data available.</div>'
+
+    summary = (
+        df.groupby('lifecycle_segment', as_index=False)
+        .agg(Stores=('store_code', 'nunique'), Revenue=('revenue', 'sum'))
+    )
+    total_stores = summary['Stores'].sum() if not summary.empty else 0
+    total_revenue = summary['Revenue'].sum() if not summary.empty else 0.0
+    order = ['New', 'Active', 'At Risk', 'Churned']
+    colors = {
+        'New': '#2563EB',
+        'Active': '#22C55E',
+        'At Risk': '#F59E0B',
+        'Churned': '#DC2626',
+    }
+
+    rows = []
+    for segment in order:
+        row = summary[summary['lifecycle_segment'] == segment]
+        stores = int(row['Stores'].iloc[0]) if not row.empty else 0
+        revenue = float(row['Revenue'].iloc[0]) if not row.empty else 0.0
+        rows.append(
+            f"<tr>"
+            f"<td style='padding:8px 10px;font-weight:700;color:{colors.get(segment,'#0F172A')};'>{escape(segment)}</td>"
+            f"<td style='padding:8px 10px;text-align:right;'>{stores:,}</td>"
+            f"<td style='padding:8px 10px;text-align:right;'>Rs {revenue/1e6:.2f}M</td>"
+            f"<td style='padding:8px 10px;text-align:right;'>{(stores / total_stores * 100 if total_stores else 0):.0f}%</td>"
+            f"<td style='padding:8px 10px;text-align:right;'>{(revenue / total_revenue * 100 if total_revenue else 0):.0f}%</td>"
+            f"</tr>"
+        )
+
+    html = (
+        "<div style='border:1px solid #D9E3EF;border-radius:12px;background:#FFFFFF;overflow:hidden;'>"
+        "<table style='width:100%;border-collapse:collapse;font-size:13px;'>"
+        "<thead><tr style='background:#F8FAFC;text-transform:uppercase;font-size:11px;letter-spacing:.03em;color:#64748B;'>"
+        "<th style='padding:10px;text-align:left;'>Segment</th>"
+        "<th style='padding:10px;text-align:right;'>Stores</th>"
+        "<th style='padding:10px;text-align:right;'>Revenue</th>"
+        "<th style='padding:10px;text-align:right;'>Store %</th>"
+        "<th style='padding:10px;text-align:right;'>Revenue %</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+    return html
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7305,10 +7913,13 @@ def render_summary_tab_content(start_date, end_date, town_code, town):
     # ── 6. VISIT → ORDER → DELIVERY FUNNEL ───────────────────────────────────
     render_summary_section_header(
         "🔄 Schedule → Visit → Order → Delivery Funnel",
-        "How calls convert through the sales pipeline per booker"
+        "How calls convert through the sales pipeline per booker with detailed metrics"
     )
 
     if calls_df is not None and not calls_df.empty:
+
+        # Fetch detailed visit data for additional metrics
+        detailed_visits_df = fetch_detailed_funnel_data(start_date, end_date, town_code)
 
         calls_agg = (
             calls_df
@@ -7340,6 +7951,41 @@ def render_summary_tab_content(start_date, end_date, town_code, town):
                 .rename(columns={"Orders": "Orders_Delivered"})
             )
             funnel_df = funnel_df.merge(lb_orders, on="Booker", how="left")
+
+        # Add detailed metrics from visits data
+        if detailed_visits_df is not None and not detailed_visits_df.empty:
+            # Parse time columns to minutes
+            detailed_visits_df['Total_Spent_Time_Minutes'] = detailed_visits_df['Total_Spent_Time'].apply(parse_time_to_minutes)
+
+            detailed_agg = (
+                detailed_visits_df
+                .groupby("Booker", as_index=False)
+                .agg(
+                    Total_Visits=("Booker", "count"),
+                    Executed_Visits=("Executed_Visit", "sum"),
+                    Productive_Visits=("Productive_Visit", "sum"),
+                    Orders_From_Visits=("Has_Order", "sum"),
+                    Total_Order_Value=("Order_Value", "sum"),
+                    Total_Order_Units=("Order_Units", "sum"),
+                    Avg_Order_Value=("Order_Value", lambda x: x[x > 0].mean() if (x > 0).any() else 0),
+                    Avg_Time_Spent=("Total_Spent_Time_Minutes", lambda x: x.dropna().mean() if x.dropna().any() else 0),
+                    Total_Time_Spent=("Total_Spent_Time_Minutes", lambda x: x.dropna().sum() if x.dropna().any() else 0),
+                )
+            )
+
+            # Close reasons distribution
+            close_reasons = (
+                detailed_visits_df[detailed_visits_df["Close_Reason"].notna() & (detailed_visits_df["Close_Reason"] != "")]
+                .groupby(["Booker", "Close_Reason"])
+                .size()
+                .reset_index(name="Count")
+                .pivot(index="Booker", columns="Close_Reason", values="Count")
+                .fillna(0)
+                .reset_index()
+            )
+
+            funnel_df = funnel_df.merge(detailed_agg, on="Booker", how="left")
+            funnel_df = funnel_df.merge(close_reasons, on="Booker", how="left")
 
         def _coalesce_metric(df, metric_name: str):
             candidate_cols = [
@@ -7373,6 +8019,26 @@ def render_summary_tab_content(start_date, end_date, town_code, town):
         total_productive = int(funnel_df["Productive_Calls"].sum())
         total_orders     = int(funnel_df["Orders"].sum()) if "Orders" in funnel_df.columns else int(cur_ord)
 
+        # Additional overall metrics
+        if detailed_visits_df is not None and not detailed_visits_df.empty:
+            total_visits = len(detailed_visits_df)
+            total_executed_visits = int(detailed_visits_df["Executed_Visit"].sum())
+            total_productive_visits = int(detailed_visits_df["Productive_Visit"].sum())
+            total_order_value = detailed_visits_df["Order_Value"].sum()
+
+            # Parse time for overall average
+            time_minutes = detailed_visits_df['Total_Spent_Time'].apply(parse_time_to_minutes).dropna()
+            avg_time_spent = time_minutes.mean() if not time_minutes.empty else None
+
+            # Close reasons summary
+            close_reasons_summary = (
+                detailed_visits_df[detailed_visits_df["Close_Reason"].notna() & (detailed_visits_df["Close_Reason"] != "")]
+                .groupby("Close_Reason")
+                .size()
+                .sort_values(ascending=False)
+                .head(5)
+            )
+
         funnelcol1, funnelcol2 = st.columns([1, 2])
         with funnelcol1:
             st.markdown("**Overall Pipeline**")
@@ -7386,6 +8052,7 @@ def render_summary_tab_content(start_date, end_date, town_code, town):
                  "pct": (total_orders / total_productive * 100) if total_productive else 0, "color": "#06B6D4"},
             ]
             render_funnel_card(stages)
+
             # Strike rate KPI
             overall_strike = (total_productive / total_planned * 100) if total_planned else 0
             strike_color = "#16A34A" if overall_strike >= 70 else "#D97706" if overall_strike >= 50 else "#DC2626"
@@ -7399,13 +8066,210 @@ def render_summary_tab_content(start_date, end_date, town_code, town):
                 unsafe_allow_html=True,
             )
 
+            # Additional KPIs
+            if detailed_visits_df is not None and not detailed_visits_df.empty:
+                col1, col2 = st.columns(2)
+                with col1:
+                    avg_time_display = f"{avg_time_spent:.1f}" if pd.notna(avg_time_spent) and avg_time_spent > 0 else "N/A"
+                    st.markdown(
+                        f"<div style='text-align:center;background:#F0F9FF;border:1px solid #BAE6FD;"
+                        f"border-radius:8px;padding:8px;margin:4px 0;'>"
+                        f"<div style='font-size:10px;color:#0369A1;text-transform:uppercase;letter-spacing:1px;'>"
+                        f"Avg Time/Visit</div>"
+                        f"<div style='font-size:18px;font-weight:700;color:#0369A1;'>"
+                        f"{avg_time_display} min</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                with col2:
+                    order_conversion = (total_orders / total_executed_visits * 100) if total_executed_visits else 0
+                    st.markdown(
+                        f"<div style='text-align:center;background:#FEF3C7;border:1px solid #FCD34D;"
+                        f"border-radius:8px;padding:8px;margin:4px 0;'>"
+                        f"<div style='font-size:10px;color:#92400E;text-transform:uppercase;letter-spacing:1px;'>"
+                        f"Order Conversion</div>"
+                        f"<div style='font-size:18px;font-weight:700;color:#92400E;'>"
+                        f"{order_conversion:.1f}%</div></div>",
+                        unsafe_allow_html=True,
+                    )
+
+                # Top Close Reasons
+                if not close_reasons_summary.empty:
+                    st.markdown("**Top Close Reasons (Overall)**")
+                    reasons_html = ""
+                    for reason, count in close_reasons_summary.items():
+                        pct = (count / total_visits * 100) if total_visits else 0
+                        reasons_html += f"<div style='display:flex;justify-content:space-between;margin:2px 0;'><span>{escape(str(reason))}</span><span>{count} ({pct:.1f}%)</span></div>"
+                    st.markdown(
+                        f"<div style='background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;padding:8px;font-size:12px;'>"
+                        f"{reasons_html}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+
+
         with funnelcol2:
             st.plotly_chart(
                 create_visit_order_delivery_funnel_chart(funnel_df, f" | {start_date}→{end_date}"),
                 use_container_width=True,
                 key="summary_funnel_chart"
             )
-    else:
+
+            # Detailed Booker Performance Table
+            if detailed_visits_df is not None and not detailed_visits_df.empty:
+                st.markdown("**Booker Performance Details**")
+
+                # Prepare detailed table data
+                detail_cols = ["Booker", "Planned_Calls", "Executed_Calls", "Productive_Calls", "Orders",
+                              "Avg_Time_Spent", "Total_Order_Value", "Avg_Order_Value"]
+
+                detail_df = funnel_df[detail_cols].copy()
+                detail_df = detail_df.sort_values("Planned_Calls", ascending=False).head(10)
+
+                # Format the table
+                detail_df["Avg_Time_Spent"] = detail_df["Avg_Time_Spent"].apply(lambda x: f"{x:.1f} min" if pd.notna(x) and x > 0 else "-")
+                detail_df["Total_Order_Value"] = detail_df["Total_Order_Value"].apply(lambda x: f"Rs {x:,.0f}" if pd.notna(x) and x > 0 else "-")
+                detail_df["Avg_Order_Value"] = detail_df["Avg_Order_Value"].apply(lambda x: f"Rs {x:,.0f}" if pd.notna(x) and x > 0 else "-")
+
+                # Rename columns for display
+                detail_df = detail_df.rename(columns={
+                    "Planned_Calls": "Planned",
+                    "Executed_Calls": "Executed",
+                    "Productive_Calls": "Productive",
+                    "Orders": "Orders",
+                    "Avg_Time_Spent": "Avg Time/Visit",
+                    "Total_Order_Value": "Total Order Value",
+                    "Avg_Order_Value": "Avg Order Value"
+                })
+
+                # Create HTML table
+                table_rows = ""
+                for _, row in detail_df.iterrows():
+                    table_rows += "<tr>"
+                    for col in detail_df.columns:
+                        if col == "Booker":
+                            table_rows += f"<td style='padding:6px 8px;font-weight:600;'>{escape(str(row[col]))}</td>"
+                        else:
+                            table_rows += f"<td style='padding:6px 8px;text-align:center;'>{escape(str(row[col]))}</td>"
+                    table_rows += "</tr>"
+
+                table_html = f"""
+                <div style='border:1px solid #D9E3EF;border-radius:8px;overflow:hidden;background:#FFFFFF;max-height:300px;overflow:auto;margin-top:8px;'>
+                    <table style='width:100%;border-collapse:collapse;font-size:12px;'>
+                        <thead>
+                            <tr style='background:#F8FAFC;font-size:11px;color:#64748B;text-transform:uppercase;letter-spacing:.05em;'>
+                                {"".join(f"<th style='padding:8px;text-align:center;'>{col}</th>" for col in detail_df.columns)}
+                            </tr>
+                        </thead>
+                        <tbody>{table_rows}</tbody>
+                    </table>
+                </div>
+                """
+
+                st.markdown(table_html, unsafe_allow_html=True)
+
+        # All Close Reasons Breakdown by Booker (Pivot Table Format) - Full Width
+        if not detailed_visits_df.empty:
+            st.markdown("**📋 Close Reasons by Booker (Pivot View)**")
+            
+            # Get all close reasons with booker breakdown
+            all_reasons_by_booker = (
+                detailed_visits_df[detailed_visits_df["Close_Reason"].notna() & (detailed_visits_df["Close_Reason"] != "")]
+                .groupby(["Booker", "Close_Reason"])
+                .size()
+                .reset_index(name="ReasonCount")
+            )
+
+            # Add total visits per booker
+            booker_total_visits = detailed_visits_df.groupby("Booker").size().reset_index(name="BookerTotalVisits")
+            all_reasons_with_pct = all_reasons_by_booker.merge(booker_total_visits, on="Booker", how="left")
+            all_reasons_with_pct["ReasonPct"] = (
+                all_reasons_with_pct["ReasonCount"] / all_reasons_with_pct["BookerTotalVisits"] * 100
+            ).round(1)
+
+            if not all_reasons_with_pct.empty:
+                # Create pivot table: Booker as rows, Close Reason as columns
+                pivot_count = all_reasons_with_pct.pivot_table(
+                    index="Booker", 
+                    columns="Close_Reason", 
+                    values="ReasonCount", 
+                    fill_value=0,
+                    aggfunc='sum'
+                )
+                
+                pivot_pct = all_reasons_with_pct.pivot_table(
+                    index="Booker", 
+                    columns="Close_Reason", 
+                    values="ReasonPct", 
+                    fill_value=0,
+                    aggfunc='sum'
+                )
+
+                # Get unique close reasons in order of frequency
+                reason_order = (
+                    all_reasons_with_pct.groupby("Close_Reason")["ReasonCount"]
+                    .sum()
+                    .sort_values(ascending=False)
+                    .index.tolist()
+                )
+                
+                # Reorder columns
+                pivot_count = pivot_count[[col for col in reason_order if col in pivot_count.columns]]
+
+                # Build HTML table with counts and percentages
+                reason_cols = pivot_count.columns.tolist()
+                header_html = "<th style='padding:8px;text-align:left;font-weight:700;'>Booker</th>"
+                for reason in reason_cols:
+                    header_html += f"<th style='padding:8px;text-align:center;font-weight:700;'>{escape(str(reason))}</th>"
+                header_html += "<th style='padding:8px;text-align:center;font-weight:700;'>Total Visits</th>"
+
+                tbody_html = ""
+                for booker in pivot_count.index:
+                    tbody_html += f"<tr><td style='padding:8px;font-weight:600;'>{escape(str(booker))}</td>"
+                    for reason in reason_cols:
+                        count = int(pivot_count.loc[booker, reason])
+                        pct = pivot_pct.loc[booker, reason]
+                        
+                        # Color coding for cells
+                        if count > 0:
+                            reason_text = str(reason).lower()
+                            if 'closed' in reason_text:
+                                cell_color = "#FEE2E2" if pct >= 20 else "#FEF3C7"
+                                text_color = "#991B1B" if pct >= 20 else "#92400E"
+                            elif 'duplicate' in reason_text:
+                                cell_color = "#DDD6FE"
+                                text_color = "#4F46E5"
+                            else:
+                                cell_color = "#F0FDF4"
+                                text_color = "#166534"
+                            
+                            tbody_html += (
+                                f"<td style='padding:8px;text-align:center;background:{cell_color};'>"
+                                f"<div style='font-weight:700;color:{text_color};'>{count}</div>"
+                                f"<div style='font-size:9px;color:#666;'>({pct:.1f}%)</div>"
+                                f"</td>"
+                            )
+                        else:
+                            tbody_html += f"<td style='padding:8px;text-align:center;background:#F9FAFB;color:#D1D5DB;'>-</td>"
+                    
+                    tbody_html += f"<td style='padding:8px;text-align:center;font-weight:600;'>{int(booker_total_visits[booker_total_visits['Booker']==booker]['BookerTotalVisits'].values[0])}</td>"
+                    tbody_html += "</tr>"
+
+                pivot_table_html = f"""
+                <div style='border:1px solid #D9E3EF;border-radius:8px;overflow-y:auto;background:#FFFFFF;margin-top:16px;height:280px;'>
+                    <table style='width:100%;border-collapse:collapse;font-size:12px;'>
+                        <thead style='background:#F3F4F6;position:sticky;top:0;'>
+                            <tr style='font-size:11px;color:#374151;text-transform:uppercase;letter-spacing:.05em;'>
+                                {header_html}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {tbody_html}
+                        </tbody>
+                    </table>
+                </div>
+                """
+                st.markdown(pivot_table_html, unsafe_allow_html=True)
+
         st.info("Calls / order data not available for funnel chart.")
 
     # ── 7. SKU/BILL PER BOOKER (bar) ─────────────────────────────────────────
@@ -8905,6 +9769,32 @@ def main():
         st.session_state["bot_runner_unlocked"] = False
         st.rerun()
     
+    # Initialize sidebar menu state
+    if "selected_menu" not in st.session_state:
+        st.session_state.selected_menu = "🗂️ Summary"
+    
+    # Sidebar menu
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📋 Navigation Menu")
+    menu_items = [
+        "🗂️ Summary",
+        "📈 Sales Growth Analysis",
+        "🎯 Booker Performance",
+        "🧭 Booker & Field Force Deep Analysis",
+        "📦 Inventory",
+        "🧪 Custom Query",
+        "🧩 Missing Data",
+        "👽 Bot Runner",
+    ]
+    
+    selected_menu = st.sidebar.radio(
+        "Select a view:",
+        menu_items,
+        key="menu_selection",
+        label_visibility="collapsed"
+    )
+    st.session_state.selected_menu = selected_menu
+    
     # Check for user date restrictions
     restrict_start, restrict_end, is_restricted, restriction_desc = get_user_date_restriction(username)
     if is_restricted:
@@ -9092,26 +9982,13 @@ def main():
 
     missing_tab_label = "🔴 🧩 Missing Data" if missing_data_has_issue else "🧩 Missing Data"
     
-    # Conditionally show tabs based on user restrictions
-    if is_restricted:
-        # Restricted users: hide Advance_Anal tab
-        tab_labels = ["🗂️ Summary","📈 Sales Growth Analysis","🎯 Booker Performance","🧭 Booker & Field Force Deep Analysis","📦 Inventory","🧪 Custom Query","🤖 Bot Runner",missing_tab_label]
-        tab_summary,tab1,tab2,tab3,tab4,tab5,tab6,tab7 = st.tabs(tab_labels)
-        adv_tab = None  # Not used for restricted users
-    else:
-        # Unrestricted users: show all tabs including Advance_Anal
-        tab_labels = ["Advance_Anal","🗂️ Summary","📈 Sales Growth Analysis","🎯 Booker Performance","🧭 Booker & Field Force Deep Analysis","📦 Inventory","🧪 Custom Query","🤖 Bot Runner",missing_tab_label]
-        adv_tab,tab_summary,tab1,tab2,tab3,tab4,tab5,tab6,tab7 = st.tabs(tab_labels)
-    
-    if adv_tab is not None:
-        with adv_tab:
-            render_sku_analytics_advanced_tab(start_date, end_date, town_code)
-
-    with tab_summary:
+    # Sidebar navigation - content rendering
+    if selected_menu == "🗂️ Summary":
              render_summary_tab_content(start_date, end_date, town_code, town)
              render_brand_coverage_tab(start_date, end_date, town_code)
-    with tab1:
-    # KPIs
+    
+    if selected_menu == "📈 Sales Growth Analysis":
+        # KPIs
         metric_top_col1, metric_top_col2 = st.columns([6, 1])
         with metric_top_col2:
             tab_metric_filter = "Ltr" if st.toggle(
@@ -9549,7 +10426,7 @@ def main():
             mopu_df = AOV_MOPU_data(town_code, months_back)
             st.plotly_chart(AOV_MOPU_bar_chart(mopu_df), use_container_width=True, key="booker_mopu_chart")
 
-    with tab2:
+    if selected_menu == "🎯 Booker Performance":
         st.subheader("🎯 Booker Performance Analysis")
         period_options_df = fetch_treemap_period_options(town_code)
 
@@ -9784,7 +10661,7 @@ def main():
                     key="gmv_ob_calendar_heatmap_chart"
                 )
 
-    with tab3:
+    if selected_menu == "🧭 Booker & Field Force Deep Analysis":
         st.subheader("🧭 Booker & Field Force Deep Analysis")
 
         deep_df = fetch_booker_fieldforce_deep_data(start_date, end_date, town_code)
@@ -10505,7 +11382,7 @@ def main():
 
 
 
-    with tab4:
+    if selected_menu == "📦 Inventory":
         st.subheader("📦 Inventory")
         inventory_data = fetch_inventory_kpi_data(end_date, town_code)
 
@@ -10926,7 +11803,7 @@ def main():
                             },
                         )
 
-    with tab5:
+    if selected_menu == "🧪 Custom Query":
         # Check if user has date restrictions - hide query runner for restricted users
         if is_restricted:
             st.warning("🔒 Custom Query Runner is restricted for limited-access users.")
@@ -11173,36 +12050,47 @@ def main():
                 except Exception as exc:
                     st.error(f"Query failed: {exc}")
 
-    with tab6:
-        st.subheader("🤖 Salesflo Bot Runner")
+    if selected_menu == "👽 Bot Runner":
+        st.subheader("👽 Salesflo Bot Runner")
         st.caption("Run Scrapper bot from dashboard and monitor logs.")
 
         expected_bot_tab_password = _get_bot_runner_password()
         if "bot_runner_unlocked" not in st.session_state:
             st.session_state["bot_runner_unlocked"] = False
+        if "bot_unlock_attempts" not in st.session_state:
+            st.session_state["bot_unlock_attempts"] = 0
 
         if not expected_bot_tab_password:
-            st.error("Bot Runner password is not configured. Set BOT_RUNNER_PASSWORD in secrets or environment.")
+            st.error("⚠️ Bot Runner password is not configured. Set BOT_RUNNER_PASSWORD in secrets or environment variables.")
+            st.info("For development, you can set: `export BOT_RUNNER_PASSWORD=admin123`")
 
         if expected_bot_tab_password and not st.session_state.get("bot_runner_unlocked"):
-            gate_col1, gate_col2 = st.columns([2, 1])
+            st.info("🔒 This tab is password protected. Enter the password to unlock.")
+            gate_col1, gate_col2, gate_col3 = st.columns([2, 1, 1])
             with gate_col1:
                 bot_runner_password_input = st.text_input(
                     "Enter Bot Runner Password",
                     type="password",
                     key="bot_runner_tab_password_input",
+                    placeholder="Enter password",
                 )
             with gate_col2:
                 st.markdown("<div style='height: 1.85rem;'></div>", unsafe_allow_html=True)
                 if st.button("🔓 Unlock", key="bot_runner_unlock_btn", type="primary"):
-                    if str(bot_runner_password_input or "") == expected_bot_tab_password:
+                    password_entered = str(bot_runner_password_input or "").strip()
+                    password_expected = str(expected_bot_tab_password or "").strip()
+                    
+                    if password_entered == password_expected:
                         st.session_state["bot_runner_unlocked"] = True
-                        st.success("Bot Runner unlocked.")
+                        st.session_state["bot_unlock_attempts"] = 0
+                        st.success("✅ Bot Runner unlocked successfully!")
                         st.rerun()
                     else:
-                        st.error("Invalid Bot Runner password.")
-
-            st.info("This tab is password protected.")
+                        st.session_state["bot_unlock_attempts"] = st.session_state.get("bot_unlock_attempts", 0) + 1
+                        st.error(f"❌ Invalid password. Attempt {st.session_state['bot_unlock_attempts']}")
+            with gate_col3:
+                if st.session_state.get("bot_unlock_attempts", 0) >= 3:
+                    st.warning("Too many failed attempts. Please refresh the page.")
         if expected_bot_tab_password and st.session_state.get("bot_runner_unlocked"):
             lock_col1, _ = st.columns([1, 5])
             with lock_col1:
@@ -11264,9 +12152,21 @@ def main():
 
             with ctrl_col4:
                 if _is_pid_running(st.session_state.get("bot_runner_pid")):
-                    st.success(f"Status: Running | PID: {st.session_state.get('bot_runner_pid')}")
+                    st.success(f"✅ Status: Running | PID: {st.session_state.get('bot_runner_pid')}")
                 else:
-                    st.info("Status: Not Running")
+                    st.info("⏸️ Status: Not Running")
+
+            # Bot Status Summary
+            st.markdown("---")
+            status_col1, status_col2, status_col3 = st.columns(3)
+            with status_col1:
+                st.metric("Bot Status", "Running" if _is_pid_running(st.session_state.get("bot_runner_pid")) else "Stopped")
+            with status_col2:
+                pid_val = st.session_state.get("bot_runner_pid")
+                st.metric("Process ID", pid_val if pid_val else "None")
+            with status_col3:
+                log_path = st.session_state.get("bot_runner_log_path") or _get_primary_bot_log_path()
+                st.metric("Log Status", "Exists" if log_path and os.path.exists(log_path) else "Pending")
 
             st.markdown("### 🔄 Refresh Data (Selected Period)")
             st.caption(f"Selected period: {start_date} to {end_date}")
@@ -11286,61 +12186,165 @@ def main():
                     else:
                         expected_password = _get_refresh_data_password()
                         if not expected_password:
-                            st.error("Refresh password is not configured. Set REFRESH_DATA_PASSWORD in secrets or environment.")
-                        elif str(refresh_password_input or "") != expected_password:
-                            st.error("Invalid refresh password.")
+                            st.error("❌ Refresh password is not configured. Set REFRESH_DATA_PASSWORD in secrets or environment.")
+                        else:
+                            # Compare passwords with whitespace trimming
+                            password_entered = str(refresh_password_input or "").strip()
+                            password_expected = str(expected_password or "").strip()
+                            
+                            if password_entered != password_expected:
+                                st.error(f"❌ Invalid refresh password.")
+                            else:
+                                try:
+                                    current_log_path = _get_primary_bot_log_path()
+                                    current_log_start = _safe_file_size(current_log_path)
+                                    refresh_env = _get_bot_runtime_env()
+                                    refresh_env.update(
+                                        {
+                                            "FORCE_START_DATE": str(start_date),
+                                            "FORCE_END_DATE": str(end_date),
+                                        }
+                                    )
+                                    new_pid = _start_bot_process(
+                                        extra_env=refresh_env
+                                    )
+                                    st.session_state["bot_runner_pid"] = int(new_pid)
+                                    st.session_state["bot_runner_log_path"] = current_log_path
+                                    st.session_state["bot_runner_log_start_pos"] = int(current_log_start)
+                                    st.session_state["bot_open_live_popup"] = True
+                                    st.success(f"✅ RefreshData started for {start_date} to {end_date} (PID: {new_pid}).")
+                                except Exception as refresh_exc:
+                                    st.error(f"❌ Could not start RefreshData: {refresh_exc}")
+            with refresh_col3:
+                st.caption("Runs bot for only selected period and updates DB rows for that range.")
+
+            st.markdown("### 📤 CSV Upload & Process")
+            st.caption("Upload CSV file to bypass fetching and directly process into DB.")
+            csv_col1, csv_col2, csv_col3 = st.columns([2, 1, 3])
+            with csv_col1:
+                report_type = st.selectbox(
+                    "Report Type",
+                    options=["end_stock_trend", "visits_summary", "ordered_vs_delivered"],
+                    key="csv_report_type",
+                    help="Select the report type for the uploaded CSV."
+                )
+                uploaded_csv = st.file_uploader(
+                    "Upload CSV File",
+                    type=["csv"],
+                    key="csv_file_uploader",
+                    help="Upload the CSV file downloaded from Salesflo (same format as Excel)."
+                )
+            with csv_col2:
+                st.markdown("<div style='height: 1.85rem;'></div>", unsafe_allow_html=True)
+                if st.button("🚀 Process CSV", key="process_csv_btn"):
+                    if _is_pid_running(st.session_state.get("bot_runner_pid")):
+                        st.warning("Bot is already running. Stop it first, then process CSV.")
+                    elif not uploaded_csv:
+                        st.error("Please upload a CSV file first.")
+                    else:
+                        # Check distributor code in CSV
+                        csv_content = uploaded_csv.getvalue().decode("utf-8")
+                        import csv
+                        from io import StringIO
+                        csv_reader = csv.reader(StringIO(csv_content))
+                        all_rows = list(csv_reader)
+                        distributor_codes = set()
+                        if report_type == "end_stock_trend":
+                            # For end_stock, distributor_code is in column 1 (0-based)
+                            HEADER_IDX = 25
+                            if len(all_rows) > HEADER_IDX + 1:
+                                data_rows = all_rows[HEADER_IDX + 1 : -1]
+                                for row in data_rows:
+                                    if len(row) > 1:
+                                        dist_code = str(row[1] or "").strip()
+                                        if dist_code:
+                                            distributor_codes.add(dist_code)
+                        else:
+                            # For other reports, assume header in first row, look for 'Distributor' column
+                            if all_rows:
+                                header = [str(c).strip().lower() for c in all_rows[0]]
+                                dist_col_idx = None
+                                for i, col in enumerate(header):
+                                    if 'distributor' in col:
+                                        dist_col_idx = i
+                                        break
+                                if dist_col_idx is not None:
+                                    import re
+                                    data_rows = all_rows[1:]
+                                    for row in data_rows:
+                                        if len(row) > dist_col_idx:
+                                            dist_value = str(row[dist_col_idx] or "").strip()
+                                            # Extract code from [DXXXXX] format
+                                            match = re.search(r'\[([^\]]+)\]', dist_value)
+                                            if match:
+                                                dist_code = match.group(1).strip()
+                                                if dist_code:
+                                                    distributor_codes.add(dist_code)
+                        
+                        if town_code not in distributor_codes:
+                            st.error(f"CSV does not contain data for selected location ({town_code}). Found distributors: {', '.join(distributor_codes) if distributor_codes else 'None'}")
                         else:
                             try:
+                                # Save uploaded file to temp location
+                                import tempfile
+                                with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="wb") as temp_file:
+                                    temp_file.write(uploaded_csv.getbuffer())
+                                    temp_csv_path = temp_file.name
+                                st.session_state["temp_csv_path"] = temp_csv_path
+                                # Start bot in CSV mode
                                 current_log_path = _get_primary_bot_log_path()
                                 current_log_start = _safe_file_size(current_log_path)
-                                refresh_env = _get_bot_runtime_env()
-                                refresh_env.update(
-                                    {
-                                        "FORCE_START_DATE": str(start_date),
-                                        "FORCE_END_DATE": str(end_date),
-                                    }
-                                )
                                 new_pid = _start_bot_process(
-                                    extra_env=refresh_env
+                                    extra_env=_get_bot_runtime_env(),
+                                    extra_args=["--csv-file", temp_csv_path, "--report-type", report_type]
                                 )
                                 st.session_state["bot_runner_pid"] = int(new_pid)
                                 st.session_state["bot_runner_log_path"] = current_log_path
                                 st.session_state["bot_runner_log_start_pos"] = int(current_log_start)
                                 st.session_state["bot_open_live_popup"] = True
-                                st.success(f"RefreshData started for {start_date} to {end_date} (PID: {new_pid}).")
-                            except Exception as refresh_exc:
-                                st.error(f"Could not start RefreshData: {refresh_exc}")
-            with refresh_col3:
-                st.caption("Runs bot for only selected period and updates DB rows for that range.")
+                                st.success(f"CSV processing started for {report_type} (PID: {new_pid}).")
+                            except Exception as csv_exc:
+                                st.error(f"Could not start CSV processing: {csv_exc}")
+            with csv_col3:
+                st.caption("Uploads CSV, parses it, and adds data to DB without fetching from Salesflo.")
 
-            lines_to_show = st.slider(
-                "Log lines",
-                min_value=50,
-                max_value=1000,
-                value=250,
-                step=50,
-                key="bot_runner_log_lines"
-            )
+            # ========== BOT LOGS SECTION ==========
+            st.markdown("### 📋 Bot Logs")
+            
+            log_col1, log_col2 = st.columns([3, 1])
+            with log_col1:
+                lines_to_show = st.slider(
+                    "Log lines to display",
+                    min_value=50,
+                    max_value=1000,
+                    value=250,
+                    step=50,
+                    key="bot_runner_log_lines"
+                )
+            with log_col2:
+                st.markdown("<div style='height: 1.85rem;'></div>", unsafe_allow_html=True)
+                if st.button("📺 Open Live Log Popup", key="bot_runner_open_popup_btn"):
+                    st.session_state["bot_open_live_popup"] = True
 
             logs_text, log_path = _read_bot_logs_tail(
                 max_lines=int(lines_to_show),
                 start_pos=st.session_state.get("bot_runner_log_start_pos", 0),
                 forced_log_path=st.session_state.get("bot_runner_log_path"),
             )
-            if log_path:
-                st.caption(f"Log file: {log_path}")
+            
+            if log_path and os.path.exists(log_path):
+                log_size = os.path.getsize(log_path) / 1024  # KB
+                st.caption(f"📁 Log file: `{log_path}` ({log_size:.2f} KB)")
             else:
-                st.caption("Log file not found yet. Start the bot to generate logs.")
+                st.caption("⚠️ Log file not found yet. Start the bot to generate logs.")
 
+            # Display logs with better formatting
             st.markdown(_render_colored_log_html(logs_text), unsafe_allow_html=True)
-
-            if st.button("📺 Open Live Log Popup", key="bot_runner_open_popup_btn"):
-                st.session_state["bot_open_live_popup"] = True
 
             if _is_pid_running(st.session_state.get("bot_runner_pid")) and st.session_state.get("bot_open_live_popup"):
                 show_bot_logs_dialog(lines_to_show)
 
-    with tab7:
+    if selected_menu == "🧩 Missing Data":
         st.subheader("🧩 Missing Data")
         st.caption("Check SKUs missing in Master SKU and SKUs with missing brand mapping.")
 

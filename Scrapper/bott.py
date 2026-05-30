@@ -1373,8 +1373,8 @@ async def set_filters(page, start_date: date_type, end_date: date_type, report_c
     """Set common report filters with report-specific toggles from config."""
     start_str = start_date.strftime("%m/%d/%Y")
     end_str   = end_date.strftime("%m/%d/%Y")
-    start_str_long = start_date.strftime("%B %d, %Y")
-    end_str_long   = end_date.strftime("%B %d, %Y")
+    start_str_long = f"{start_date.strftime('%B')} {start_date.day}, {start_date.year}"
+    end_str_long   = f"{end_date.strftime('%B')} {end_date.day}, {end_date.year}"
 
     log.info(f"Setting filters: {start_str} -> {end_str}")
 
@@ -1560,26 +1560,41 @@ async def set_filters(page, start_date: date_type, end_date: date_type, report_c
         if target is None:
             raise RuntimeError(f"{label} field not found.")
 
-        try:
-            await target.click(timeout=5000)
-        except Exception:
-            pass
+        async def _write_value(value: str) -> bool:
+            try:
+                await target.click(timeout=5000)
+            except Exception:
+                pass
 
-        try:
-            await target.fill("")
-            await target.fill(value_primary)
-            await target.press("Enter")
-            return
-        except Exception:
-            pass
+            try:
+                await target.fill("")
+                await target.fill(value)
+                await target.press("Enter")
+            except Exception:
+                pass
 
-        try:
-            await target.fill("")
-            await target.fill(value_alt)
-            await target.press("Enter")
+            try:
+                current_value = await target.input_value()
+            except Exception:
+                current_value = ""
+
+            if value in current_value or (value_alt and value_alt in current_value):
+                await target.evaluate(
+                    """
+                    (el) => {
+                        el.blur();
+                        el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    }
+                    """,
+                )
+                return True
+
+            return False
+
+        if await _write_value(value_primary):
             return
-        except Exception:
-            pass
+        if await _write_value(value_alt):
+            return
 
         await target.evaluate(
             """
@@ -1593,10 +1608,21 @@ async def set_filters(page, start_date: date_type, end_date: date_type, report_c
                 el.dispatchEvent(new Event('change', { bubbles: true }));
                 el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
                 el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+                el.blur();
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
             }
             """,
             value_primary,
         )
+
+        try:
+            current_value = await target.input_value()
+            if value_primary in current_value or value_alt in current_value:
+                return
+        except Exception:
+            pass
+
+        log.warning(f"Could not confirm {label} value after fill.")
 
     # Start Date (Salesflo expects format like "February 27, 2026")
     await _fill_date(
