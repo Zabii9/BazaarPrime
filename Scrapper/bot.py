@@ -1515,7 +1515,7 @@ async def login(page, username: str, password: str, account_label: str = "accoun
             if await button.count() == 0:
                 continue
             try:
-                await button.click(timeout=2000)
+                await button.click(timeout=5000)
                 clicked = True
                 break
             except PlaywrightTimeout:
@@ -3188,7 +3188,7 @@ async def _launch_browser_with_bootstrap(pw):
     _ensure_playwright_browser_available()
 
     try:
-        return await pw.chromium.launch(headless=True)
+        return await pw.chromium.launch(headless=False)
     except Exception as exc:
         err_text = str(exc)
         if "error while loading shared libraries" in err_text or "libglib-2.0.so.0" in err_text:
