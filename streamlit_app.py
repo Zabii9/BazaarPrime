@@ -1829,29 +1829,65 @@ def dm_wise_unique_productivity_growth_data(start, end, town_code):
 def tgtvsach_YTD_data(town_code):
     """Fetch target vs achievement YTD data for comparison charts"""
     db_name = "db42280"
-    
+
     query = f"""
-SELECT 
-concat(MONTH(`Delivery Date`),"-",YEAR(`Delivery Date`)) as period,
-round(t.Target_In_Value) as Target_Value,
-round(sum(`Delivered Amount`+`Total Discount`)) as NMV,
-Round((sum(`Delivered Amount`+`Total Discount`)/t.Target_In_Value)*100) as Value_Ach,
-round(t.Target_In_Volume) as Target_Ltr,
-round(sum(`Delivered (Litres)`+`Delivered (KG)`)) as Ltr,
-Round((sum(`Delivered (Litres)`+`Delivered (KG)`)/t.Target_In_Volume)*100) as Ltr_Ach,
-Case when o.`Distributor Code`='D70002202' then 'Karachi'
-				when o.`Distributor Code`='D70002246' then 'Lahore' else 'CBL' end Town
+WITH target_rollup AS (
+    SELECT
+        Distributor_Code,
+        month,
+        year,
+        SUM(Target_In_Value) AS Target_In_Value,
+        SUM(Target_In_Volume) AS Target_In_Volume
+    FROM targets
+    WHERE Distributor_Code = '{town_code}'
+      AND (year < 2026 OR (year = 2026 AND month <= 2))
+    GROUP BY Distributor_Code, month, year
 
+    UNION ALL
 
-
- from ordered_vs_delivered_rows o
- LEFT JOIN (SELECT month,year,sum(Target_In_Value) as Target_In_Value,sum(Target_In_Volume) as Target_In_Volume,Distributor_Code  from targets group by year,month,Distributor_Code) t on t.month= month(o.`Delivery Date`) and t.year=YEAR(o.`Delivery Date`) and t.Distributor_Code = o.`Distributor Code`
-where o.`Distributor Code` = '{town_code}'
- GROUP BY MONTH(`Delivery Date`),YEAR(`Delivery Date`),Town
-order by YEAR(`Delivery Date`) desc,MONTH(`Delivery Date`) desc
- limit 10
-
-
+    SELECT
+        Distributor_Code,
+        month,
+        year,
+        SUM(COALESCE(Target, 0)) AS Target_In_Value,
+        0 AS Target_In_Volume
+    FROM targets_new
+    WHERE Distributor_Code = '{town_code}'
+      AND KPI = 'Value'
+      AND (year > 2026 OR (year = 2026 AND month >= 3))
+    GROUP BY Distributor_Code, month, year
+), sales_rollup AS (
+    SELECT
+        o.`Distributor Code` AS Distributor_Code,
+        MONTH(o.`Delivery Date`) AS month,
+        YEAR(o.`Delivery Date`) AS year,
+        CASE
+            WHEN o.`Distributor Code` = 'D70002202' THEN 'Karachi'
+            WHEN o.`Distributor Code` = 'D70002246' THEN 'Lahore'
+            ELSE 'CBL'
+        END AS Town,
+        ROUND(SUM(o.`Delivered Amount` + o.`Total Discount`)) AS NMV,
+        ROUND(SUM(o.`Delivered (Litres)` + o.`Delivered (KG)`)) AS Ltr
+    FROM ordered_vs_delivered_rows o
+    WHERE o.`Distributor Code` = '{town_code}'
+    GROUP BY o.`Distributor Code`, MONTH(o.`Delivery Date`), YEAR(o.`Delivery Date`)
+)
+SELECT
+    CONCAT(s.month, '-', s.year) AS period,
+    ROUND(COALESCE(t.Target_In_Value, 0)) AS Target_Value,
+    s.NMV,
+    ROUND((s.NMV / NULLIF(COALESCE(t.Target_In_Value, 0), 0)) * 100) AS Value_Ach,
+    ROUND(COALESCE(t.Target_In_Volume, 0)) AS Target_Ltr,
+    s.Ltr,
+    ROUND((s.Ltr / NULLIF(COALESCE(t.Target_In_Volume, 0), 0)) * 100) AS Ltr_Ach,
+    s.Town
+FROM sales_rollup s
+LEFT JOIN target_rollup t
+    ON t.Distributor_Code = s.Distributor_Code
+   AND t.month = s.month
+   AND t.year = s.year
+ORDER BY s.year DESC, s.month DESC
+LIMIT 10
 """
 
     return read_sql_cached(query, db_name)
@@ -1860,29 +1896,72 @@ order by YEAR(`Delivery Date`) desc,MONTH(`Delivery Date`) desc
 def tgtvsach_YTD_heatmap_data(town_code):
     """Fetch target vs achievement YTD data for heatmap visualization"""
     db_name = "db42280"
-    
+
     query = f"""
-    SELECT 
-o.`Order Booker Name` as Booker,
-concat(MONTH(`Delivery Date`),"-",YEAR(`Delivery Date`)) as period,
-round(t.Target_In_Value) as Target_Value,
-round(sum(`Delivered Amount`+`Total Discount`)) as NMV,
-Round((sum(`Delivered Amount`+`Total Discount`)/t.Target_In_Value)*100) as Value_Ach,
-round(t.Target_In_Volume) as Target_Ltr,
-round(sum(`Delivered (Litres)`+`Delivered (KG)`)) as Ltr,
-Round((sum(`Delivered (Litres)`+`Delivered (KG)`)/t.Target_In_Volume)*100) as Ltr_Ach,
-Case when o.`Distributor Code`='D70002202' then 'Karachi'
-				when o.`Distributor Code`='D70002246' then 'Lahore' else 'CBL' end Town
+WITH target_rollup AS (
+    SELECT
+        Distributor_Code,
+        Order_Booker_Code,
+        month,
+        year,
+        SUM(Target_In_Value) AS Target_In_Value,
+        SUM(Target_In_Volume) AS Target_In_Volume
+    FROM targets
+    WHERE Distributor_Code = '{town_code}'
+      AND (year < 2026 OR (year = 2026 AND month <= 2))
+    GROUP BY Distributor_Code, Order_Booker_Code, month, year
 
+    UNION ALL
 
-
- from ordered_vs_delivered_rows o
- LEFT JOIN (SELECT month,year,sum(Target_In_Value) as Target_In_Value,sum(Target_In_Volume) as Target_In_Volume,Distributor_Code,Order_Booker_Code  from targets group by year,month,Distributor_Code,Order_Booker_Code) t on t.month= month(o.`Delivery Date`) and t.year=YEAR(o.`Delivery Date`) and t.Distributor_Code = o.`Distributor Code` and t.Order_Booker_Code=o.`Order Booker Code`
-where o.`Distributor Code` = '{town_code}'
- GROUP BY MONTH(`Delivery Date`),YEAR(`Delivery Date`),Town,o.`Order Booker Name`
-order by YEAR(`Delivery Date`) desc,MONTH(`Delivery Date`) desc
---
-    """
+    SELECT
+        Distributor_Code,
+        `AppUser Code` AS Order_Booker_Code,
+        month,
+        year,
+        SUM(COALESCE(Target, 0)) AS Target_In_Value,
+        0 AS Target_In_Volume
+    FROM targets_new
+    WHERE Distributor_Code = '{town_code}'
+      AND KPI = 'Value'
+      AND (year > 2026 OR (year = 2026 AND month >= 3))
+    GROUP BY Distributor_Code, `AppUser Code`, month, year
+), sales_rollup AS (
+    SELECT
+        o.`Distributor Code` AS Distributor_Code,
+        o.`Order Booker Code` AS Order_Booker_Code,
+        o.`Order Booker Name` AS Booker,
+        MONTH(o.`Delivery Date`) AS month,
+        YEAR(o.`Delivery Date`) AS year,
+        CASE
+            WHEN o.`Distributor Code` = 'D70002202' THEN 'Karachi'
+            WHEN o.`Distributor Code` = 'D70002246' THEN 'Lahore'
+            ELSE 'CBL'
+        END AS Town,
+        ROUND(SUM(o.`Delivered Amount` + o.`Total Discount`)) AS NMV,
+        ROUND(SUM(o.`Delivered (Litres)` + o.`Delivered (KG)`)) AS Ltr
+    FROM ordered_vs_delivered_rows o
+    WHERE o.`Distributor Code` = '{town_code}'
+    GROUP BY o.`Distributor Code`, o.`Order Booker Code`, o.`Order Booker Name`, MONTH(o.`Delivery Date`), YEAR(o.`Delivery Date`)
+)
+SELECT
+    s.Booker,
+    CONCAT(s.month, '-', s.year) AS period,
+    ROUND(COALESCE(t.Target_In_Value, 0)) AS Target_Value,
+    s.NMV,
+    ROUND((s.NMV / NULLIF(COALESCE(t.Target_In_Value, 0), 0)) * 100) AS Value_Ach,
+    ROUND(COALESCE(t.Target_In_Volume, 0)) AS Target_Ltr,
+    s.Ltr,
+    ROUND((s.Ltr / NULLIF(COALESCE(t.Target_In_Volume, 0), 0)) * 100) AS Ltr_Ach,
+    s.Town
+FROM sales_rollup s
+LEFT JOIN target_rollup t
+    ON t.Distributor_Code = s.Distributor_Code
+   AND t.Order_Booker_Code = s.Order_Booker_Code
+   AND t.month = s.month
+   AND t.year = s.year
+WHERE STR_TO_DATE(CONCAT(s.year, '-', LPAD(s.month, 2, '0'), '-01'), '%%Y-%%m-%%d') >= DATE_SUB(LAST_DAY(CURDATE()), INTERVAL 11 MONTH)
+ORDER BY s.year DESC, s.month DESC, s.Booker
+"""
     return read_sql_cached(query, db_name)
 
 @st.cache_data(ttl=3600)
@@ -8234,16 +8313,20 @@ def build_visit_brand_coverage(start_date, end_date, town_code):
             sf[f"flag_{_brand_col(brand)}"] = sf["brand_classified"] == brand
         sf["flag_other"] = ~sf["brand_classified"].isin(brand_universe)
         
+        brand_agg_kwargs = {
+            **{
+                f"sold_{_brand_col(b)}": (f"flag_{_brand_col(b)}", "max")
+                for b in brand_universe
+            },
+            "sold_other": ("flag_other", "max"),
+        }
+
         sales_by_doc = (
             sf[sf["doc_no"] != ""]
             .groupby(["store_code", "doc_no"], as_index=False)
             .agg(
                 total_nmv=("nmv", "sum"),
-                **{
-                    f"sold_{_brand_col(b)}": (f"flag_{_brand_col(b)}", "max")
-                    for b in brand_universe
-                },
-                sold_other=("flag_other", "max"),
+                **brand_agg_kwargs,
             )
         )
 
@@ -8271,11 +8354,7 @@ def build_visit_brand_coverage(start_date, end_date, town_code):
             sf.groupby(["store_code", "booker_name", "visit_date"], as_index=False)
             .agg(
                 total_nmv=("nmv", "sum"),
-                **{
-                    f"sold_{_brand_col(b)}": (f"flag_{_brand_col(b)}", "max")
-                    for b in brand_universe
-                },
-                sold_other=("flag_other", "max"),
+                **brand_agg_kwargs,
             )
         )
 
@@ -11538,7 +11617,6 @@ def main():
                                         dist_col_idx = i
                                         break
                                 if dist_col_idx is not None:
-                                    import re
                                     data_rows = all_rows[1:]
                                     for row in data_rows:
                                         if len(row) > dist_col_idx:

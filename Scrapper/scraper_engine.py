@@ -176,6 +176,12 @@ async def ensure_report_table(conn, report_cfg: dict) -> None:
                 )
                 log.info("Migrated: fixed column type %s.%s -> %s", table, exact_name, new_type)
 
+    # Sync connection state after DDL (MySQL auto-commits DDL but
+    # aiomysql with autocommit=False can get out of sync)
+    try:
+        await conn.commit()
+    except Exception:
+        pass
     log.info("Table ready: %s", table)
 
 
@@ -210,8 +216,20 @@ async def save_generic_rows(conn, table: str, rows: list[dict]) -> int:
     for row in rows:
         data.append(tuple(row.get(k) for k in sorted_keys) + (row["row_hash"], row["row_json"]))
 
-    async with conn.cursor() as cur:
-        await cur.executemany(sql, data)
+    # Split into chunks to avoid max_allowed_packet issues on large datasets
+    chunk_size = 200
+    saved = 0
+    for i in range(0, len(data), chunk_size):
+        chunk = data[i : i + chunk_size]
+        async with conn.cursor() as cur:
+            await cur.executemany(sql, chunk)
+            saved += cur.rowcount if cur.rowcount > 0 else len(chunk)
+        # Explicit commit per chunk — needed when autocommit=False on the connection
+        # and also flushes data when autocommit=True (no-op but harmless)
+        try:
+            await conn.commit()
+        except Exception:
+            pass
     return len(rows)
 
 
@@ -258,8 +276,15 @@ async def save_end_stock_rows(conn, table: str, rows: list[dict]) -> int:
         )
         for r in rows
     ]
-    async with conn.cursor() as cur:
-        await cur.executemany(sql, data)
+    chunk_size = 200
+    for i in range(0, len(data), chunk_size):
+        chunk = data[i : i + chunk_size]
+        async with conn.cursor() as cur:
+            await cur.executemany(sql, chunk)
+        try:
+            await conn.commit()
+        except Exception:
+            pass
     return len(rows)
 
 
@@ -270,7 +295,11 @@ async def get_last_saved_date(conn, table: str, account_label: str = "") -> Opti
         else:
             await cur.execute(f"SELECT MAX(report_date) FROM `{table}`")
         row = await cur.fetchone()
-        return row[0] if row and row[0] else None
+    try:
+        await conn.commit()   # close any implicit read transaction
+    except Exception:
+        pass
+    return row[0] if row and row[0] else None
 
 
 async def log_run(conn, **kwargs):
@@ -287,6 +316,10 @@ async def log_run(conn, **kwargs):
                 kwargs.get("action_type", "run"), kwargs.get("message", ""),
             ),
         )
+    try:
+        await conn.commit()
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -588,8 +621,25 @@ def _build_alias_map(columns: list[dict]) -> dict[str, str]:
 
 
 def _is_header_candidate(row: list[str], alias_map: dict[str, str], min_hits: int = 2) -> bool:
+    """
+    Return True if enough cells in `row` match known column aliases.
+    Also returns True if the row looks like a text header (no numeric values)
+    and has at least one alias hit — catches jqGrid headers that arrive with
+    partial label matches.
+    """
     hits = sum(1 for cell in row if _normalize(cell) in alias_map)
-    return hits >= min_hits
+    if hits >= min_hits:
+        return True
+    # Looser check: at least 1 alias hit AND no cells look like data values
+    if hits >= 1:
+        numeric_cells = sum(
+            1 for cell in row
+            if cell.strip() and cell.strip().replace(",", "").replace(".", "").replace("-", "").isdigit()
+        )
+        # A header row should have very few or no numeric cells
+        if numeric_cells == 0:
+            return True
+    return False
 
 
 def parse_table(
@@ -605,6 +655,7 @@ def parse_table(
     alias_map = _build_alias_map(columns)
 
     # ── Find header row ───────────────────────────────────────────────────────
+    # Priority: explicit header in table rows > external jqGrid header > synthetic
     header_idx = None
     for i, row in enumerate(table_rows):
         if _is_header_candidate([str(c) for c in row], alias_map):
@@ -612,17 +663,35 @@ def parse_table(
             break
 
     if header_idx is not None:
-        header = [str(c).strip() for c in table_rows[header_idx]]
+        header    = [str(c).strip() for c in table_rows[header_idx]]
         data_rows = table_rows[header_idx + 1:]
+        log.info("Header found in table row %d: %s", header_idx, header[:6])
+
     elif external_header and _is_header_candidate([str(c) for c in external_header], alias_map):
-        header = [str(c).strip() for c in external_header]
+        header    = [str(c).strip() for c in external_header]
         data_rows = table_rows
+        log.info("Using jqGrid external header (%d cols): %s", len(header), header[:6])
+
+    elif external_header:
+        # External header exists but alias hits < min_hits — use it anyway
+        # (positional fallback in _parse_generic will fill gaps)
+        header    = [str(c).strip() for c in external_header]
+        data_rows = table_rows
+        log.info(
+            "Using low-confidence external header (%d cols) with positional fallback: %s",
+            len(header), header[:6],
+        )
+
     else:
-        # Synthetic: use canonical column order
-        widest = max((len(r) for r in table_rows), default=0)
-        header = [col["name"] for col in columns[:widest]]
+        # No usable header at all — use canonical column names positionally
+        widest    = max((len(r) for r in table_rows), default=0)
+        header    = [col["name"] for col in columns[:widest]]
         data_rows = table_rows
-        log.warning("Using synthetic header for %s", report_cfg["title"])
+        log.warning(
+            "Using synthetic header for %s (%d cols). "
+            "Positional mapping active — column order must match report layout.",
+            report_cfg["title"], len(header),
+        )
 
     normalized_header = [str(h).strip() for h in header]
 
@@ -642,7 +711,22 @@ def _parse_end_stock(
     start_date: date_type,
     end_date: date_type,
 ) -> list[dict]:
-    """Unpivot: one output row per (fixed_cols × date_col)."""
+    """
+    Unpivot End Stock Trend: one output row per (fixed_cols x date_col).
+
+    The jqGrid table on showreport.php has this column layout:
+      Col 0: S#
+      Col 1: Distributor Code
+      Col 2: Distributor Name
+      Col 3: SKU Description
+      Col 4: SKU Code
+      Col 5: Brand Name
+      Col 6: Brand Code
+      Col 7+: date columns (one per day in the selected range)
+
+    The extHeader from jqGrid contains the column labels including date strings
+    like "2026-06-01", "2026-06-02" etc.
+    """
     norm_header = [h.lower() for h in header]
 
     def _find_col(*keys: str) -> Optional[int]:
@@ -651,54 +735,124 @@ def _parse_end_stock(
                 return i
         return None
 
+    # ── Locate fixed identifier columns ───────────────────────────────────────
     idx_dist_code  = _find_col("distributor code")
-    idx_dist_name  = _find_col("distributor name")
-    idx_sku_desc   = _find_col("sku description", "sku desc")
-    idx_sku_code   = _find_col("sku code")
-    idx_brand_name = _find_col("brand name")
+    idx_dist_name  = _find_col("distributor name", "distributor")
+    idx_sku_desc   = _find_col("sku description", "sku desc", "description")
+    idx_sku_code   = _find_col("sku code", "sku")
+    idx_brand_name = _find_col("brand name", "brand")
     idx_brand_code = _find_col("brand code")
 
-    # Date columns start after all fixed columns
-    fixed_boundary = max(
-        [i for i in [idx_dist_code, idx_dist_name, idx_sku_desc, idx_sku_code, idx_brand_name, idx_brand_code]
-         if i is not None],
-        default=6,
-    ) + 1
-
-    date_indices = [
-        i for i, label in enumerate(header)
-        if i >= fixed_boundary and parse_date(label, warn=False) is not None
+    # ── Determine where date columns start ────────────────────────────────────
+    known_fixed_indices = [
+        i for i in [idx_dist_code, idx_dist_name, idx_sku_desc,
+                    idx_sku_code, idx_brand_name, idx_brand_code]
+        if i is not None
     ]
-    if not date_indices:
-        date_indices = list(range(fixed_boundary, len(header)))
+    fixed_boundary = (max(known_fixed_indices) + 1) if known_fixed_indices else 7
 
+    # Try to find date columns by parsing header labels
+    date_col_map: dict[int, date_type] = {}   # col_index -> parsed_date
+    for i, label in enumerate(header):
+        if i < fixed_boundary:
+            continue
+        parsed = parse_date(label, warn=False)
+        if parsed is not None:
+            date_col_map[i] = parsed
+
+    # ── Fallback: if header has no parseable dates (synthetic header scenario)
+    # Infer dates from start_date/end_date and map to columns positionally.
+    if not date_col_map:
+        # Figure out how many date columns exist from the widest data row
+        max_cols = max((len(r) for r in data_rows), default=0)
+        n_date_cols = max_cols - fixed_boundary
+        if n_date_cols > 0:
+            log.info(
+                "End stock: no date headers found — inferring %d date cols from range %s -> %s",
+                n_date_cols, start_date, end_date,
+            )
+            # Generate date sequence matching the report range
+            total_days = (end_date - start_date).days + 1
+            date_seq = [start_date + timedelta(days=i) for i in range(total_days)]
+            # If fewer date columns than days, align to end_date (most recent days)
+            if n_date_cols <= len(date_seq):
+                date_seq = date_seq[-n_date_cols:]
+            for i, d in enumerate(date_seq):
+                date_col_map[fixed_boundary + i] = d
+
+    if not date_col_map:
+        log.warning("End stock: could not determine any date columns. Returning 0 rows.")
+        return []
+
+    log.info(
+        "End stock: %d fixed cols boundary=%d, %d date cols: %s ... %s",
+        fixed_boundary, fixed_boundary, len(date_col_map),
+        min(date_col_map.values()), max(date_col_map.values()),
+    )
+
+    # ── Use fixed positional fallbacks if index detection failed ─────────────
+    if idx_dist_code  is None: idx_dist_code  = 1
+    if idx_dist_name  is None: idx_dist_name  = 2
+    if idx_sku_desc   is None: idx_sku_desc   = 3
+    if idx_sku_code   is None: idx_sku_code   = 4
+    if idx_brand_name is None: idx_brand_name = 5
+    if idx_brand_code is None: idx_brand_code = 6
+
+    # ── Unpivot rows ──────────────────────────────────────────────────────────
     rows = []
     for row in data_rows:
         if not row or all(str(v).strip() == "" for v in row):
             continue
-        if "total" in str(row[0]).strip().lower():
+        first_cell = str(row[0]).strip().lower()
+        if "total" in first_cell:
+            continue
+        # Skip pure header/label rows
+        if first_cell in ("s#", "s.no", "sno", "#"):
             continue
 
-        def _cell(i: Optional[int]) -> str:
-            return str(row[i] or "").strip() if i is not None and i < len(row) else ""
+        def _cell(i: int) -> str:
+            return str(row[i] or "").strip() if i < len(row) else ""
 
-        for col_idx in date_indices:
+        dist_code  = _cell(idx_dist_code)
+        dist_name  = _cell(idx_dist_name)
+        sku_desc   = _cell(idx_sku_desc)
+        sku_code   = _cell(idx_sku_code)
+        brand_name = _cell(idx_brand_name)
+        brand_code = _cell(idx_brand_code)
+
+        # Skip rows that have no distributor or SKU identity
+        if not dist_code and not sku_code:
+            continue
+
+        for col_idx, report_dt in date_col_map.items():
             if col_idx >= len(row):
                 continue
-            label = header[col_idx] if col_idx < len(header) else ""
-            parsed_dt = parse_date(label, warn=False) or fallback_date
+            val = to_float(row[col_idx])
             rows.append({
-                "report_date":      parsed_dt,
-                "distributor_code": _cell(idx_dist_code),
-                "distributor_name": _cell(idx_dist_name),
-                "sku_code":         _cell(idx_sku_code),
-                "sku_description":  _cell(idx_sku_desc),
-                "brand_code":       _cell(idx_brand_code),
-                "brand_name":       _cell(idx_brand_name),
-                "value":            to_float(row[col_idx]),
+                "report_date":      report_dt,
+                "distributor_code": dist_code,
+                "distributor_name": dist_name,
+                "sku_code":         sku_code,
+                "sku_description":  sku_desc,
+                "brand_code":       brand_code,
+                "brand_name":       brand_name,
+                "value":            val,
                 "unit":             "Value",
             })
     return rows
+
+
+# Null-like values returned by Salesflo/jqGrid that should map to None
+_NULL_CELL_VALUES = frozenset({
+    "", "(null)", "null", "none", "n/a", "na", "-", "--",
+    "0000-00-00", "00/00/0000",
+})
+
+
+def _clean_cell(val) -> str:
+    """Normalize a raw cell value — strip whitespace and collapse null-like strings."""
+    s = " ".join(str(val or "").split()).strip()
+    return "" if s.lower() in _NULL_CELL_VALUES else s
 
 
 def _parse_generic(
@@ -708,52 +862,104 @@ def _parse_generic(
     alias_map: dict[str, str],
     fallback_date: date_type,
 ) -> list[dict]:
-    """Map each data row to canonical column names, type-cast, hash."""
-    col_meta = {col["name"]: col for col in columns}
-    rows = []
+    """
+    Map each data row to canonical column names, type-cast, and hash.
 
+    Two mapping strategies in priority order:
+      1. Alias map  — header cell text matches a known alias  (preferred)
+      2. Positional — header cell index matches column index  (fallback for
+                      synthetic/unrecognised headers)
+
+    Both strategies then type-cast values using the column's is_date /
+    is_float / is_int flags and clean Salesflo null strings like "(Null)".
+    """
+    col_meta = {col["name"]: col for col in columns}
+
+    # Build a positional fallback: header index -> column definition
+    # Used when alias lookup fails (synthetic header or unexpected label).
+    positional_map: dict[int, dict] = {}
+    unmatched_header_indices = []
+    for hi, hlabel in enumerate(header):
+        norm_lbl = _normalize(hlabel)
+        canon_name = alias_map.get(norm_lbl)
+        if canon_name:
+            # Already covered by alias map — no positional entry needed
+            pass
+        else:
+            unmatched_header_indices.append(hi)
+
+    # Map unmatched header positions to columns that haven't been claimed yet
+    claimed_col_names = set()
+    for hi, hlabel in enumerate(header):
+        norm_lbl = _normalize(hlabel)
+        if alias_map.get(norm_lbl):
+            claimed_col_names.add(alias_map[norm_lbl])
+
+    unclaimed_cols = [c for c in columns if c["name"] not in claimed_col_names]
+    for hi, col in zip(unmatched_header_indices, unclaimed_cols):
+        positional_map[hi] = col
+
+    rows = []
     for row in data_rows:
-        if not row or all(str(v).strip() == "" for v in row):
+        if not row or all(_clean_cell(v) == "" for v in row):
             continue
-        if "total" in str(row[0]).strip().lower():
+        first = _clean_cell(row[0]).lower()
+        if "total" in first:
             continue
-        full_text = " ".join(str(v).strip().lower() for v in row)
+        full_text = " ".join(_clean_cell(v).lower() for v in row)
         if full_text in {"print", ""} or full_text.startswith("print "):
             continue
 
-        # Map raw cells to canonical names
-        raw_map: dict[str, str] = {}
-        for i, col_name in enumerate(header):
-            if i < len(row):
-                raw_map[col_name or f"col_{i}"] = str(row[i] or "").strip()
-
         canonical: dict[str, Any] = {}
-        for raw_key, raw_val in raw_map.items():
-            mapped = alias_map.get(_normalize(raw_key))
-            if mapped:
-                meta = col_meta.get(mapped, {})
-                if meta.get("is_date"):
-                    canonical[mapped] = parse_date(raw_val, warn=False)
-                elif meta.get("is_float"):
-                    canonical[mapped] = to_float(raw_val)
-                elif meta.get("is_int"):
-                    canonical[mapped] = to_int(raw_val)
-                else:
-                    canonical[mapped] = raw_val
 
-        # Ensure all columns present
+        # ── Strategy 1: alias map ─────────────────────────────────────────────
+        for hi, hlabel in enumerate(header):
+            if hi >= len(row):
+                break
+            raw_val = _clean_cell(row[hi])
+            norm_lbl = _normalize(hlabel)
+            mapped = alias_map.get(norm_lbl)
+            if not mapped:
+                continue
+            meta = col_meta.get(mapped, {})
+            if meta.get("is_date"):
+                canonical[mapped] = parse_date(raw_val, warn=False) if raw_val else None
+            elif meta.get("is_float"):
+                canonical[mapped] = to_float(raw_val) if raw_val else None
+            elif meta.get("is_int"):
+                canonical[mapped] = to_int(raw_val) if raw_val else None
+            else:
+                canonical[mapped] = raw_val or None
+
+        # ── Strategy 2: positional fallback for unmatched header positions ────
+        for hi, col in positional_map.items():
+            if col["name"] in canonical:
+                continue          # already mapped via alias
+            if hi >= len(row):
+                continue
+            raw_val = _clean_cell(row[hi])
+            if col.get("is_date"):
+                canonical[col["name"]] = parse_date(raw_val, warn=False) if raw_val else None
+            elif col.get("is_float"):
+                canonical[col["name"]] = to_float(raw_val) if raw_val else None
+            elif col.get("is_int"):
+                canonical[col["name"]] = to_int(raw_val) if raw_val else None
+            else:
+                canonical[col["name"]] = raw_val or None
+
+        # ── Ensure every column key is present ────────────────────────────────
         for col in columns:
             if col["name"] not in canonical:
                 canonical[col["name"]] = None
 
-        # Derive report_date from first date column found
+        # ── Derive report_date from the first non-null date column ────────────
         report_date = fallback_date
         for col in columns:
             if col.get("is_date") and canonical.get(col["name"]):
                 report_date = canonical[col["name"]]
                 break
 
-        # Skip entirely empty rows
+        # ── Skip rows that have no real data beyond date/hash fields ──────────
         has_data = any(
             v not in (None, "", 0)
             for k, v in canonical.items()
@@ -762,15 +968,17 @@ def _parse_generic(
         if not has_data:
             continue
 
-        row_json = json.dumps({"canonical": {k: str(v) for k, v in canonical.items()}, "raw": list(row)}, ensure_ascii=False, sort_keys=True)
+        row_json = json.dumps(
+            {"canonical": {k: str(v) for k, v in canonical.items()}, "raw": list(row)},
+            ensure_ascii=False, sort_keys=True,
+        )
         row_hash = hashlib.sha256(row_json.encode()).hexdigest()
 
         out = {
-            "report_date":   report_date,
-            "row_hash":      row_hash,
-            "row_json":      row_json,
+            "report_date": report_date,
+            "row_hash":    row_hash,
+            "row_json":    row_json,
         }
-        # Use db_col names as keys for DB insert
         for col in columns:
             out[col["db_col"]] = canonical.get(col["name"])
 
@@ -815,6 +1023,7 @@ async def generate_and_parse(
         except PlaywrightTimeout:
             await gen_btn.click(timeout=5000)
     else:
+        # No modal — report may open in same tab or a new tab
         for _ in range(30):
             new_pages = [p for p in page.context.pages if p not in existing_pages]
             if new_pages:
@@ -828,62 +1037,186 @@ async def generate_and_parse(
         except PlaywrightTimeout:
             log.warning("Report page slow to load; continuing with available DOM.")
 
-        # ── Poll for stable table ─────────────────────────────────────────────
+        # ── Give jqGrid time to fire its initial AJAX request ─────────────────
+        # Salesflo showreport.php renders an empty jqGrid shell first, then
+        # fires an XHR to populate rows. We must wait for that XHR to finish
+        # before reading the DOM — otherwise we see 0 rows.
+        await asyncio.sleep(3)
+
+        # ── DOM reader — handles both jqGrid and plain <table> layouts ────────
         async def _read_payload(root) -> dict:
             try:
                 return await root.evaluate(r"""
                 () => {
-                    const clean = s => (s || '').replace(/\s+/g,' ').trim();
-                    const noRec = ['no record found','no records found','sorry! no record','sorry no record'].some(p => clean(document.body?.innerText||'').toLowerCase().includes(p));
-                    const tables = Array.from(document.querySelectorAll('#StickyTable,.ui-jqgrid-btable,table'));
-                    if (!tables.length) return {rows:[],extHeader:[],noRecords:noRec};
-                    const scored = tables.map(tbl => {
-                        const rows = Array.from(tbl.querySelectorAll('tr'))
-                            .map(tr => Array.from(tr.querySelectorAll('th,td')).map(td => clean(td.innerText||td.textContent)))
-                            .filter(r => r.length && r.join('').trim());
-                        const gridRoot = tbl.closest('.ui-jqgrid-view')||tbl.closest('.ui-jqgrid');
-                        const extHeader = gridRoot
-                            ? Array.from(gridRoot.querySelectorAll('.ui-jqgrid-htable th')).map(th => clean(th.innerText||th.textContent)).filter(Boolean)
-                            : Array.from(tbl.querySelectorAll('thead th')).map(th => clean(th.innerText||th.textContent)).filter(Boolean);
-                        return {rows, extHeader, score: rows.length*100 + Math.max(...rows.map(r=>r.length),0) + extHeader.length*5, noRecords:noRec};
-                    });
-                    scored.sort((a,b)=>b.score-a.score);
-                    return scored[0]||{rows:[],extHeader:[],noRecords:noRec};
+                    const clean = s => (s||'').replace(/\s+/g,' ').trim();
+
+                    const bodyText = clean(document.body?.innerText||'').toLowerCase();
+                    const noRecPatterns = [
+                        'sorry! no record found','sorry! no records found',
+                        'sorry no record found','sorry no records found',
+                        'no record found','no records found',
+                    ];
+                    const noRecords = noRecPatterns.some(p => bodyText.includes(p));
+
+                    // ── Strategy 1: jqGrid ────────────────────────────────────
+                    // jqGrid splits headers (.ui-jqgrid-htable) and body (.ui-jqgrid-btable)
+                    // into separate DOM tables — we must combine them.
+                    const jqGridViews = Array.from(document.querySelectorAll('.ui-jqgrid-view, .ui-jqgrid'));
+                    for (const gridView of jqGridViews) {
+                        // Headers: from the header table
+                        const hdrCells = Array.from(
+                            gridView.querySelectorAll('.ui-jqgrid-htable th[id], .ui-jqgrid-htable th')
+                        );
+                        const extHeader = hdrCells
+                            .map(th => clean(th.innerText||th.textContent))
+                            .filter(h => h && h !== '&nbsp;' && h !== ' ');
+
+                        // Body rows: from the body table
+                        const bodyTable = gridView.querySelector('.ui-jqgrid-btable');
+                        if (!bodyTable) continue;
+
+                        const dataRows = Array.from(bodyTable.querySelectorAll('tr[id]'))
+                            .map(tr => Array.from(tr.querySelectorAll('td'))
+                                .map(td => clean(td.innerText||td.textContent)))
+                            .filter(r => r.length > 0 && r.some(c => c));
+
+                        if (extHeader.length > 0 || dataRows.length > 0) {
+                            return {
+                                rows: dataRows,
+                                extHeader: extHeader,
+                                noRecords: noRecords,
+                                source: 'jqgrid',
+                            };
+                        }
+                    }
+
+                    // ── Strategy 2: StickyTable / plain <table> ───────────────
+                    const candidates = Array.from(document.querySelectorAll(
+                        '#StickyTable, table.report-table, table'
+                    ));
+
+                    let best = {rows:[], extHeader:[], noRecords, score:0, source:'table'};
+                    for (const tbl of candidates) {
+                        const allRows = Array.from(tbl.querySelectorAll('tr'))
+                            .map(tr => Array.from(tr.querySelectorAll('th,td'))
+                                .map(td => clean(td.innerText||td.textContent)))
+                            .filter(r => r.length > 0 && r.some(c => c));
+
+                        const thRows = Array.from(tbl.querySelectorAll('thead tr'))
+                            .map(tr => Array.from(tr.querySelectorAll('th'))
+                                .map(th => clean(th.innerText||th.textContent)))
+                            .filter(r => r.some(c => c));
+
+                        const extHeader = thRows.length > 0
+                            ? thRows[0]
+                            : (allRows.length > 0 ? allRows[0] : []);
+
+                        const dataRows = thRows.length > 0 ? allRows : allRows.slice(1);
+                        const score = dataRows.length * 100
+                            + (extHeader.length * 5)
+                            + Math.max(...(dataRows.map(r => r.length).concat([0])));
+
+                        if (score > best.score) {
+                            best = {rows: allRows, extHeader, noRecords, score, source:'table'};
+                        }
+                    }
+                    return best;
+                }
+                """)
+            except Exception as exc:
+                return {"rows": [], "extHeader": [], "noRecords": False, "source": "error"}
+
+        # ── Check if jqGrid is still loading ──────────────────────────────────
+        async def _is_loading(root) -> bool:
+            try:
+                return await root.evaluate("""
+                () => {
+                    // jqGrid loading indicator
+                    const loading = document.querySelector('.ui-jqgrid-loading');
+                    if (loading) {
+                        const s = window.getComputedStyle(loading);
+                        if (s.display !== 'none' && s.visibility !== 'hidden') return true;
+                    }
+                    // Generic loading text
+                    const txt = (document.body?.innerText||'').toLowerCase();
+                    return txt.includes('loading...') || txt.includes('please wait');
                 }
                 """)
             except Exception:
-                return {"rows": [], "extHeader": [], "noRecords": False}
+                return False
 
         best = {"rows": [], "extHeader": [], "noRecords": False}
         last_sig = None
-        stable = 0
+        stable   = 0
         no_records = False
+        required_stable = 3   # need 3 consecutive identical polls = truly settled
 
-        for _ in range(max_wait_s):
+        log.info("Waiting for report table to populate...")
+        for poll_n in range(max_wait_s):
             for root in [report_page] + list(report_page.frames):
                 payload = await _read_payload(root)
                 if payload.get("noRecords"):
                     no_records = True
-                size = len(payload.get("rows", [])) + len(payload.get("extHeader", []))
-                best_size = len(best.get("rows", [])) + len(best.get("extHeader", []))
-                if size >= best_size:
+
+                cur_rows = len(payload.get("rows", []))
+                cur_hdr  = len(payload.get("extHeader", []))
+                best_rows = len(best.get("rows", []))
+                best_hdr  = len(best.get("extHeader", []))
+
+                # Always keep the largest payload seen
+                if cur_rows > best_rows or (cur_rows == best_rows and cur_hdr > best_hdr):
                     best = payload
 
             rows = best.get("rows", [])
-            ext = best.get("extHeader", [])
-            sig = (len(rows), len(ext), tuple(tuple(c[:3] for c in r[:4]) for r in rows[:2]))
-            if sig == last_sig:
+            ext  = best.get("extHeader", [])
+
+            # Stability signature: row count + header count + first 2 row previews
+            sig = (
+                len(rows), len(ext),
+                tuple(tuple(str(c)[:6] for c in r[:5]) for r in rows[:3]),
+            )
+
+            still_loading = await _is_loading(report_page)
+
+            if sig == last_sig and not still_loading:
                 stable += 1
             else:
-                stable = 0
+                if sig != last_sig:
+                    log.info(
+                        "  Table growing: %d rows, %d header cols (poll %d)",
+                        len(rows), len(ext), poll_n,
+                    )
+                stable   = 0
                 last_sig = sig
-            if rows and stable >= 2:
+
+            # Exit when stable AND we actually have rows
+            if rows and stable >= required_stable:
+                log.info(
+                    "  Table stable at %d rows, %d header cols after %d polls.",
+                    len(rows), len(ext), poll_n,
+                )
                 break
+
             await asyncio.sleep(1)
 
-        if no_records and not best.get("rows"):
+        # Debug: log what we got before parsing
+        rows_got = best.get("rows", [])
+        ext_got  = best.get("extHeader", [])
+        log.info(
+            "Raw table read: %d data rows | %d header cols | source=%s",
+            len(rows_got), len(ext_got), best.get("source", "?"),
+        )
+        if ext_got:
+            log.info("  Header sample: %s", ext_got[:8])
+        if rows_got:
+            log.info("  First data row: %s", rows_got[0][:8])
+
+        if no_records and not rows_got and not ext_got:
             log.info("Report returned no records.")
             return []
+
+        if not rows_got and not ext_got:
+            raise RuntimeError("Report table not found after waiting.")
 
         if not best.get("rows") and not best.get("extHeader"):
             raise RuntimeError("Report table not found after waiting.")

@@ -233,11 +233,17 @@ def filter_accounts(
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def get_db() -> aiomysql.Connection:
+    """
+    autocommit=False so:
+      - save_generic_rows / save_end_stock_rows do explicit conn.commit() per chunk
+      - forced_refresh can do begin() / commit() / rollback() atomically
+      - all DDL (CREATE TABLE, ALTER TABLE) auto-commits in MySQL regardless
+    """
     return await aiomysql.connect(
         host=DB_HOST, port=DB_PORT,
         user=DB_USER, password=DB_PASS,
         db=DB_NAME, charset="utf8mb4",
-        autocommit=True,
+        autocommit=False,
     )
 
 
@@ -260,6 +266,11 @@ async def ensure_bot_log_table(conn):
                 created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
+    # DDL auto-commits in MySQL but we sync the connection state
+    try:
+        await conn.commit()
+    except Exception:
+        pass
 
 
 async def delete_period(
@@ -297,7 +308,14 @@ async def delete_period(
             return count
 
         await cur.execute(sql_delete, tuple(params))
-        return int(cur.rowcount or 0)
+        deleted = int(cur.rowcount or 0)
+
+    # Commit the DELETE immediately so subsequent INSERT sees clean state
+    try:
+        await conn.commit()
+    except Exception:
+        pass
+    return deleted
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -355,7 +373,8 @@ async def forced_refresh(
 
         parse_mode = report_cfg.get("parse_mode", "generic")
 
-        await conn.begin()
+        # Atomic: delete old period rows then insert fresh data
+        # autocommit=False on this connection so this is a real transaction
         try:
             deleted = await delete_period(conn, table, start_date, end_date, account_label)
 
@@ -366,7 +385,10 @@ async def forced_refresh(
 
             await conn.commit()
         except Exception:
-            await conn.rollback()
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
             raise
 
         await log_run(
@@ -441,12 +463,12 @@ async def launch_browser(pw):
     browser_path = str(Path.home() / ".cache" / "ms-playwright")
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", browser_path)
     try:
-        return await pw.chromium.launch(headless=True)
+        return await pw.chromium.launch(headless=False)
     except Exception as exc:
         if "Executable doesn't exist" in str(exc) or "Please run" in str(exc):
             import subprocess
             subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-            return await pw.chromium.launch(headless=True)
+            return await pw.chromium.launch(headless=False)
         raise
 
 
@@ -702,6 +724,100 @@ def _print_summary(results: list[dict], dry_run: bool = False) -> None:
         log.warning("%s Run finished -- all reports returned no data or were skipped.", WARN)
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DB DIAGNOSTIC
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _run_db_check():
+    """
+    Verify DB connection and show live row counts per table per account.
+    Run with:  python main.py --db-check
+    """
+    print()
+    print("=" * 60)
+    print("  DB CONNECTION CHECK")
+    print("=" * 60)
+    print(f"  Host : {DB_HOST}:{DB_PORT}")
+    print(f"  DB   : {DB_NAME}")
+    print(f"  User : {DB_USER}")
+    print()
+
+    try:
+        conn = await get_db()
+        await conn.commit()
+        print("  [OK] Connected successfully.")
+        print()
+    except Exception as exc:
+        print(f"  [FAIL] Cannot connect: {exc}")
+        print()
+        print("  Check DB_HOST / DB_PORT / DB_USER / DB_PASSWORD in your .env")
+        return
+
+    try:
+        # Tables to check
+        report_tables = [(k, v["db_table"]) for k, v in REPORT_REGISTRY.items()]
+        report_tables.append(("bot_run_log", "bot_run_log"))
+
+        async with conn.cursor() as cur:
+            for report_key, table in report_tables:
+                # Check table exists
+                await cur.execute(
+                    "SELECT COUNT(*) FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
+                    (DB_NAME, table),
+                )
+                exists = (await cur.fetchone())[0]
+                if not exists:
+                    print(f"  [MISSING] {table:<40} (table does not exist yet)")
+                    continue
+
+                # Total rows
+                await cur.execute(f"SELECT COUNT(*) FROM `{table}`")
+                total = (await cur.fetchone())[0]
+
+                # Per-account breakdown
+                try:
+                    await cur.execute(
+                        f"SELECT account_label, COUNT(*), MAX(report_date) "
+                        f"FROM `{table}` GROUP BY account_label ORDER BY account_label"
+                    )
+                    acct_rows = await cur.fetchall()
+                except Exception:
+                    acct_rows = []
+
+                print(f"  {table:<40} total={total:>7,}")
+                for acct_label, acct_count, acct_max_date in acct_rows:
+                    label = str(acct_label or "(no label)")
+                    print(f"    └─ {label:<22} rows={acct_count:>7,}   latest={acct_max_date}")
+
+                # Last 3 bot_run_log entries for this report
+                if table != "bot_run_log":
+                    try:
+                        await cur.execute(
+                            "SELECT account_label, status, rows_saved, period_start, period_end, created_at "
+                            "FROM bot_run_log WHERE report_key=%s ORDER BY id DESC LIMIT 3",
+                            (report_key,),
+                        )
+                        runs = await cur.fetchall()
+                        if runs:
+                            print(f"    Last runs in bot_run_log:")
+                            for acc, st, rs, ps, pe, ca in runs:
+                                print(f"      [{st:<7}] {str(acc):<14} saved={rs:>5}  {ps} -> {pe}  @ {ca}")
+                    except Exception:
+                        pass
+                print()
+
+        await conn.commit()
+    finally:
+        try:
+            await conn.ensure_closed()
+        except Exception:
+            pass
+
+    print("=" * 60)
+    print()
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CLI
 # ══════════════════════════════════════════════════════════════════════════════
@@ -785,6 +901,7 @@ EXAMPLES
     # ── Info flags ────────────────────────────────────────────────────────────
     parser.add_argument("--list-reports",  "-l", action="store_true", help="List all registered reports and exit.")
     parser.add_argument("--list-accounts", "-L", action="store_true", help="List all configured account labels and exit.")
+    parser.add_argument("--db-check",      "-D", action="store_true", help="Check DB connection and show live row counts per table/account.")
 
     args = parser.parse_args()
 
@@ -815,6 +932,11 @@ EXAMPLES
         for label, username, _ in accts:
             print(f"  {label:<20}  {username}")
         print()
+        sys.exit(0)
+
+    # ── --db-check ────────────────────────────────────────────────────────────
+    if args.db_check:
+        asyncio.run(_run_db_check())
         sys.exit(0)
 
     # ── Parse report keys ─────────────────────────────────────────────────────
